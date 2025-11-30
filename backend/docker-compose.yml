@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: mdbs_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: mdbs
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data          # persistent DB data
+      - ./init-postgres:/docker-entrypoint-initdb.d:ro  # init scripts run once on empty volume
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo:
+    image: mongo:6.0
+    container_name: mdbs_mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db                        # persistent DB data
+      - ./init-mongo:/docker-entrypoint-initdb.d:ro  # mongo init scripts (JS) run once on empty volume
+    environment:
+      MONGO_INITDB_DATABASE: mdbs
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5.11.0-community
+    container_name: mdbs_neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: "neo4j/neo4jpassword"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4jdata:/data
+      - neo4jlogs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  milvus:
+    image: milvusdb/milvus:v2.2.9
+    container_name: mdbs_milvus
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+    ports:
+      - "19530:19530"
+      - "19121:19121"
+    volumes:
+      - milvusdata:/var/lib/milvus
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:19121/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  pgdata:
+  mongodata:
+  neo4jdata:
+  neo4jlogs:
+  milvusdata:

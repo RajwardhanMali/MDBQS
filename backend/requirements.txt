@@ -1,0 +1,67 @@
+fastapi==0.109.0
+uvicorn==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+httpx==0.26.0
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+
+# Database drivers
+psycopg2-binary==2.9.9
+pymongo==4.6.1
+neo4j==5.16.0
+sqlalchemy==2.0.25
+motor==3.3.2
+
+# Vector database
+qdrant-client==1.7.0
+sentence-transformers==2.3.1
+
+# LangGraph and LangChain
+langgraph==0.0.20
+langchain==0.1.4
+langchain-google-genai==0.0.6
+
+# Google AI
+google-generativeai==0.3.2
+
+# Utilities
+python-dotenv==1.0.0
+numpy==1.26.3
+networkx==3.2.1
+redis==5.0.1
+tenacity==8.2.3fastapi==0.109.0
+uvicorn==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+httpx==0.26.0
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+
+# Database drivers
+psycopg2-binary==2.9.9
+pymongo==4.6.1
+neo4j==5.16.0
+sqlalchemy==2.0.25
+motor==3.3.2
+
+# Vector database
+qdrant-client==1.7.0
+sentence-transformers==2.3.1
+
+# LangGraph and LangChain
+langgraph==0.0.20
+langchain==0.1.4
+langchain-google-genai==0.0.6
+
+# Google AI
+google-generativeai==0.3.2
+
+# Utilities
+python-dotenv==1.0.0
+numpy==1.26.3
+networkx==3.2.1
+redis==5.0.1
+tenacity==8.2.3
