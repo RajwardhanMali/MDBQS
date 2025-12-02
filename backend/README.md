@@ -255,19 +255,6 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Visit **http://localhost:8000/docs** (Swagger UI) or **http://localhost:8000/redoc** (ReDoc).
 
-### Step 5: Run Tests
-
-```powershell
-# All tests
-pytest -v
-
-# Specific test file
-pytest app/tests/test_end_to_end.py -v
-
-# With coverage
-pytest --cov=app app/tests/
-```
-
 ---
 
 ## 💻 Example Usage
@@ -309,56 +296,6 @@ asyncio.run(main())
 
 ---
 
-## 🧪 Testing
-
-### Unit Tests
-
-**Planner Tests** (`app/tests/test_unit_planner.py`):
-```python
-pytest app/tests/test_unit_planner.py -v
-```
-
-**Fusion Tests** (`app/tests/test_unit_fusion.py`):
-```python
-pytest app/tests/test_unit_fusion.py -v
-```
-
-### End-to-End Tests
-
-**Full Query Pipeline** (`app/tests/test_end_to_end.py`):
-```python
-pytest app/tests/test_end_to_end.py -v
-```
-
-Uses FastAPI `TestClient` to validate the `/api/v1/query` endpoint.
-
----
-
-## 🔐 Security & Environment
-
-### Environment Variables
-
-All sensitive configuration is in `.env`. **Never commit `.env` to version control.**
-
-- `POSTGRES_DSN` — PostgreSQL connection string
-- `MONGO_URI` — MongoDB connection URI
-- `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` — Neo4j credentials
-- `GEMINI_API_KEY` — Google Generative AI API key
-- `APP_ENV` — `"development"` or `"production"`
-
-### CORS
-
-Currently configured to allow all origins for development:
-```python
-allow_origins=["*"],
-allow_methods=["*"],
-allow_headers=["*"],
-```
-
-**⚠️ For production, restrict to specific domains.**
-
----
-
 ## 📦 Dependencies
 
 | Category | Packages |
@@ -389,62 +326,3 @@ See `requirements.txt` for exact versions.
 - [ ] Ran tests (`pytest -v`)
 
 ---
-
-## 🤝 Contributing
-
-When adding new services or endpoints:
-
-1. **Add API route** in `app/api/v1/`
-2. **Add service logic** in `app/services/`
-3. **Update models** in `app/models/state.py` if needed
-4. **Write tests** in `app/tests/`
-5. **Document** in this README
-
----
-
-## 📝 License & Attribution
-
-This project is part of the EDAI program at [Your University].
-
----
-
-## 🆘 Troubleshooting
-
-### Database Connection Errors
-```
-Check that docker-compose services are running:
-docker-compose ps
-
-Verify environment variables in .env match docker-compose credentials.
-```
-
-### Gemini API Errors
-```
-If GEMINI_API_KEY is missing or invalid, the planner falls back to deterministic rules.
-Set GEMINI_API_KEY in .env to enable LLM-assisted planning.
-```
-
-### Port Conflicts
-```
-If port 8000 is already in use:
-python -m uvicorn app.main:app --reload --port 8001
-```
-
-### Test Failures
-```
-Ensure databases are running (docker-compose ps)
-and .env is properly configured.
-
-Run with increased verbosity:
-pytest -vv --tb=short
-```
-
----
-
-## 📞 Support
-
-For issues or questions:
-1. Check the troubleshooting section above
-2. Review inline code comments
-3. Run tests to validate setup
-4. Consult the API documentation at `http://localhost:8000/docs`
