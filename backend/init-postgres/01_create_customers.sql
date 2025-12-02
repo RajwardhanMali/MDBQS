@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS customers (
 );
 
 INSERT INTO customers (id, name, email, embedding) VALUES
-('cust1','Alice Kumar','alice@example.com','[0.1, 0.2, 0.3]') ON CONFLICT (id) DO NOTHING,
-('cust2','Bob Singh','bob@example.com','[0.0, 0.2, 0.7]') ON CONFLICT (id) DO NOTHING,
-('cust3','Charlie Rao','charlie@example.com','[0.9, 0.1, 0.0]') ON CONFLICT (id) DO NOTHING;
+('cust1','Alice Kumar','alice@example.com','[0.1, 0.2, 0.3]'),
+('cust2','Bob Singh','bob@example.com','[0.0, 0.2, 0.7]'),
+('cust3','Charlie Rao','charlie@example.com','[0.9, 0.1, 0.0]') 
+ON CONFLICT (id) DO NOTHING;

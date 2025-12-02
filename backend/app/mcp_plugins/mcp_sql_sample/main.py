@@ -37,7 +37,9 @@ async def get_schema():
 
 @app.post("/execute_sql")
 async def execute_sql(payload: dict):
+    print(payload)
     query = payload.get("query")
+    print(query)
     # VERY SIMPLE: only allow SELECT for MVP
     if not query.strip().lower().startswith("select"):
         return {"rows": [], "meta": {"error": "Only SELECT allowed in MVP"}}
