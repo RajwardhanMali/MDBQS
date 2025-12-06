@@ -1,11 +1,13 @@
 # app/main.py
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, logger
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1 import query as query_router, schema as schema_router
 from app.services import mcp_manager
 from app.services.mcp_manager import register_mcp
 import os
+
+from app.services.schema_index import SchemaIndex, source_schema_from_dict
 
 load_dotenv()
 
@@ -40,18 +42,32 @@ app.add_middleware(
 # register routers
 app.include_router(query_router.router)
 app.include_router(schema_router.router)
-
-
-register_mcp({"id":"sql_customers","host":"http://localhost:8001", "capabilities":["query.sql"]})
-register_mcp({"id":"orders_mongo","host":"http://localhost:8002", "capabilities":["query.document"]})
-register_mcp({"id":"graph_referrals","host":"http://localhost:8003", "capabilities":["query.graph"]})
-register_mcp({"id":"vector_customers","host":"http://localhost:8004", "capabilities":["query.vector"]})
-
+schema_index = SchemaIndex()
 
 @app.on_event("startup")
 async def startup():
     # initialize MCP manager (does minimal work)
-    await mcp_manager.init_managers(settings)
+    DEFAULT_MCPS = [
+        {"id": "sql_customers", "host": "http://localhost:8001", "capabilities": ["query.sql"]},
+        {"id": "orders_mongo", "host": "http://localhost:8002", "capabilities": ["query.document"]},
+        {"id": "graph_referrals", "host": "http://localhost:8003", "capabilities": ["query.graph"]},
+        {"id": "vector_customers", "host": "http://localhost:8004", "capabilities": ["query.vector"]},
+    ]
+    for manifest in DEFAULT_MCPS:
+        if manifest["id"] not in mcp_manager.MCP_REGISTRY:
+            mcp_manager.register_mcp(manifest)
+
+    # Fetch schemas from each MCP
+        async def fetch_all_schemas():
+            for mcp_id in mcp_manager.MCP_REGISTRY.keys():
+                try:
+                    schema_json = await mcp_manager.call_execute(mcp_id, "get_schema", {})
+                    schema = source_schema_from_dict(schema_json)
+                    schema_index.register_schema(schema)
+                except Exception as e:
+                    print(e)
+
+        await fetch_all_schemas()
 
 @app.get("/")
 async def root():

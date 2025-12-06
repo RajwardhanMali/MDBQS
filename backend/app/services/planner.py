@@ -1,111 +1,134 @@
 # app/services/planner.py
-import uuid
 import json
 import logging
 from typing import List, Dict, Any
+
 from app.core.llm.gemini_client import GeminiClient
 from app.models.state import PlanNode
-from app.services.schema_index import schema_index
+from app.services.schema_index import schema_index, source_schema_from_dict
 from app.services import mcp_manager
 
 logger = logging.getLogger("planner")
 logger.setLevel(logging.INFO)
 
-# Initialize Gemini client (mock_mode=False to use actual Gemini if configured)
 gemini = GeminiClient(api_key=None, mock_mode=False)
+
+_SCHEMAS_LOADED = False  # module-level flag
+
+
+async def _ensure_schemas_loaded() -> None:
+    """
+    Lazy-load schemas from all registered MCPs into schema_index.
+
+    If MCP_REGISTRY is empty (common when running scripts like test.py
+    without FastAPI startup), we also register default MCP manifests here.
+    """
+    global _SCHEMAS_LOADED
+
+    if _SCHEMAS_LOADED and schema_index.schemas:
+        return
+
+    # If no MCPs registered yet, register some defaults (for local dev)
+    if not mcp_manager.MCP_REGISTRY:
+        logger.info("MCP_REGISTRY is empty; registering default local MCPs...")
+        DEFAULT_MCPS = [
+            {"id": "sql_customers", "host": "http://localhost:8001", "capabilities": ["query.sql"]},
+            {"id": "orders_mongo", "host": "http://localhost:8002", "capabilities": ["query.document"]},
+            {"id": "graph_referrals", "host": "http://localhost:8003", "capabilities": ["query.graph"]},
+            {"id": "vector_customers", "host": "http://localhost:8004", "capabilities": ["query.vector"]},
+        ]
+        for manifest in DEFAULT_MCPS:
+            mcp_manager.register_mcp(manifest)
+
+    if not mcp_manager.MCP_REGISTRY:
+        logger.warning("MCP_REGISTRY still empty; no schemas to load.")
+        _SCHEMAS_LOADED = True
+        return
+
+    logger.info("Loading schemas from MCPs into schema_index...")
+    for mcp_id in mcp_manager.MCP_REGISTRY.keys():
+        try:
+            logger.info("Fetching schema from MCP %s", mcp_id)
+            schema_json = await mcp_manager.call_execute(mcp_id, "get_schema", {})
+            logger.info("Schema from %s: %s", mcp_id, schema_json)
+            schema = source_schema_from_dict(schema_json)
+            schema_index.register_schema(schema)
+        except Exception as e:
+            logger.exception("Failed to fetch schema for %s: %s", mcp_id, e)
+
+    _SCHEMAS_LOADED = True
+    logger.info("Schema loading complete. Schemas: %s", list(schema_index.schemas.keys()))
+
+
+def _capability_from_tool(db_type: str, tool: str) -> str:
+    """
+    Map (db_type, tool) to the legacy capability string used by PlanNode.
+    """
+    tool = (tool or "").lower()
+    db_type = (db_type or "").lower()
+
+    if tool == "execute_sql" or db_type == "sql":
+        return "query.sql"
+    if tool == "find" or db_type == "nosql":
+        return "query.document"
+    if tool == "traverse" or db_type == "graph":
+        return "query.graph"
+    if tool == "search" or db_type == "vector":
+        return "query.vector"
+    return "query.sql"
+
 
 async def plan(nl_query: str) -> List[PlanNode]:
     """
-    Create a plan for the natural language query.
-    Steps:
-      1) Get schema hints from schema_index (top fields & mcp ids)
-      2) Call GeminiClient.plan_query(...) to get a structured plan (or fallback)
-      3) Validate and enrich plan nodes: map capabilities -> preferred MCP ids
-      4) Return list[PlanNode]
+    Dynamic planner:
+    1) Ensure schemas are loaded from MCPs (lazy).
+    2) Build 'sources' description for Gemini.
+    3) Ask Gemini for a JSON list of steps (LLM-native plan).
+    4) Map each step into a PlanNode (store full step JSON in subquery_nl).
     """
-    # 1) schema hints
-    # use schema_index.search_fields with top-k tokens from query for hints
-    # very simple: ask schema_index for fields matching important tokens
-    hints = []
-    # take a few keywords (split, remove stopwords minimal)
-    tokens = [t for t in nl_query.lower().split() if len(t) > 2]
-    seen_mcp = set()
-    for tok in tokens[:6]:
-        hits = schema_index.search_fields(tok, top_k=3)
-        for h in hits:
-            mcp = h.get("mcp")
-            if mcp and mcp not in seen_mcp:
-                seen_mcp.add(mcp)
-                hints.append({"mcp_id": mcp, "field": h.get("field"), "parent": h.get("parent")})
-    logger.info("Schema hints for planner: %s", hints)
+    # 1) make sure we have schema metadata
+    if not schema_index.schemas:
+        await _ensure_schemas_loaded()
 
-    # 2) call LLM planner
-    resp = await gemini.plan_query(nl_query, schema_hints=hints)
-    raw_plan = resp.get("plan", []) if isinstance(resp, dict) else []
-    logger.info("Raw plan from Gemini/heuristic: %s", json.dumps(raw_plan, indent=2))
+    # 2) build sources for LLM
+    sources = schema_index.build_sources_for_llm()
+    logger.info("Planner LLM sources: %s", json.dumps(sources, indent=2))
 
-    plan_nodes = []
-    id_map = {}  # map returned id to PlanNode id
-    # prefer mapping from capability -> registered MCP ids
-    capability_to_mcp = _map_capability_to_mcp()
+    # Also build simple candidates for heuristic fallback
+    candidates = schema_index.discover_candidates(nl_query)
 
-    for node in raw_plan:
-        # basic validation
-        capability = node.get("capability")
-        if capability not in {"query.sql","query.document","query.graph","query.vector"}:
-            logger.warning("Skipping unsupported capability: %s", capability)
-            continue
-        nid = node.get("id") or f"p{len(plan_nodes)+1}"
-        preferred = node.get("preferred") or capability_to_mcp.get(capability)
-        pn = PlanNode(
-            id=nid,
-            type=node.get("intent","lookup"),
-            subquery_nl=node.get("native_query", node.get("intent","")),
-            capability=capability,
-            target_candidates=[],
-            preferred=preferred,
-            depends_on=node.get("depends_on")
-        )
-        plan_nodes.append(pn)
-        id_map[nid] = pn
+    # 3) get plan from Gemini / heuristic
+    resp = await gemini.plan_query(nl_query, entity_candidates=candidates, sources=sources)
+    raw_steps = resp.get("plan", []) if isinstance(resp, dict) else []
+    logger.info("LLM plan steps: %s", json.dumps(raw_steps, indent=2))
 
-    # If no nodes returned, fallback: if schema hints suggest SQL, create SQL node
-    if not plan_nodes:
-        logger.info("No plan nodes returned by LLM; using fallback heuristics.")
-        # fallback uses heuristic planner to generate conservative SQL lookup
-        fallback = gemini._heuristic_plan(nl_query, hints)
-        for node in fallback:
-            capability = node.get("capability")
-            preferred = capability_to_mcp.get(capability)
+    plan_nodes: List[PlanNode] = []
+
+    for step in raw_steps:
+        try:
+            step_id = step["id"]
+            mcp_id = step["mcp_id"]
+            db_type = step.get("db_type", "")
+            tool = step.get("tool", "")
+            desc = step.get("description") or step.get("intent") or "step"
+
+            capability = _capability_from_tool(db_type, tool)
+
+            # Store the entire step JSON in subquery_nl so execution can see tool/input/etc.
+            step_json = json.dumps(step)
+
             pn = PlanNode(
-                id=node.get("id","p1"),
-                type=node.get("intent","lookup"),
-                subquery_nl=node.get("native_query",""),
+                id=step_id,
+                type=desc,
+                subquery_nl=step_json,
                 capability=capability,
-                preferred=preferred
+                target_candidates=[],
+                preferred=mcp_id,
+                depends_on=step.get("depends_on"),
             )
             plan_nodes.append(pn)
+        except Exception as e:
+            logger.exception("Invalid plan step from LLM, skipping: %s", e)
 
-    logger.info("Final plan nodes: %s", [p.model_dump() for p in plan_nodes])
+    logger.info("Final PlanNodes: %s", [p.model_dump() for p in plan_nodes])
     return plan_nodes
-
-def _map_capability_to_mcp() -> Dict[str,str]:
-    """
-    Map capabilities to available registered MCP ids (preferred).
-    This uses the in-memory mcp_manager registry to find best candidate.
-    """
-    mapping = {}
-    registry = mcp_manager.MCP_REGISTRY
-    for mcp_id, manifest in registry.items():
-        caps = manifest.get("capabilities", [])
-        for c in caps:
-            # Normalize: convert "query.sql" to "query.sql"
-            mapping[c] = mcp_id
-    # Provide reasonable defaults if not present
-    if "query.sql" not in mapping:
-        # try common ids
-        for candidate in ["sql_customers","postgres","mysql","sql_db"]:
-            if candidate in registry:
-                mapping["query.sql"] = candidate
-                break
-    return mapping

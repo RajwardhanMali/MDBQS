@@ -12,8 +12,8 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data          # persistent DB data
-      - ./init-postgres:/docker-entrypoint-initdb.d:ro  # init scripts run once on empty volume
+      - pgdata:/var/lib/postgresql/data                     # persistent DB data
+      - ./init-postgres:/docker-entrypoint-initdb.d:ro      # init scripts run once on empty volume
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -27,8 +27,8 @@ services:
     ports:
       - "27017:27017"
     volumes:
-      - mongodata:/data/db                        # persistent DB data
-      - ./init-mongo:/docker-entrypoint-initdb.d:ro  # mongo init scripts (JS) run once on empty volume
+      - mongodata:/data/db                                  # persistent DB data
+      - ./init-mongo:/docker-entrypoint-initdb.d:ro         # mongo init scripts (JS) run once on empty volume
     environment:
       MONGO_INITDB_DATABASE: mdbs
     healthcheck:
@@ -55,6 +55,7 @@ services:
       timeout: 5s
       retries: 6
 
+  # --- MILVUS DEPENDENCIES (Etcd, MinIO) ---
   etcd:
     container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.5
@@ -64,7 +65,7 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+      - milvus-etcd:/etcd  # FIXED: Simplified volume mapping
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
@@ -79,7 +80,7 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+      - milvus-minio:/minio_data # FIXED: Simplified volume mapping
     command: minio server /minio_data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -87,6 +88,7 @@ services:
       timeout: 20s
       retries: 3
 
+  # --- MILVUS STANDALONE ---
   standalone:
     container_name: milvus-standalone
     image: milvusdb/milvus:v2.2.16
@@ -95,7 +97,7 @@ services:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+      - milvusdata:/var/lib/milvus # CRITICAL FIX: Changed to use 'milvusdata' volume and simplified mapping.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
@@ -109,9 +111,12 @@ services:
       - "etcd"
       - "minio"
 
+# --- VOLUME DEFINITIONS (All named volumes must be defined here) ---
 volumes:
   pgdata:
   mongodata:
   neo4jdata:
   neo4jlogs:
-  milvusdata:
+  milvusdata:   # Used by the standalone service
+  milvus-etcd:  # Used by the etcd service
+  milvus-minio: # Used by the minio service

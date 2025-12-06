@@ -14,22 +14,31 @@ MONGO_DB = os.getenv("MONGO_DB", "mdbs")
 async def startup():
     app.state.client = AsyncIOMotorClient(MONGO_URI)
     app.state.db = app.state.client[MONGO_DB]
-    coll = app.state.db["orders"]
-    # seed if empty
-    if await coll.count_documents({}) == 0:
-        docs = [
-            {"order_id":"o1","customer_id":"cust1","amount":120.0,"order_date": "2025-10-01"},
-            {"order_id":"o2","customer_id":"cust1","amount":30.0,"order_date": "2025-09-01"},
-            {"order_id":"o3","customer_id":"cust2","amount":75.0,"order_date": "2025-10-05"},
-        ]
-        await coll.insert_many(docs)
 
-@app.get("/schema")
+@app.post("/get_schema")
 async def get_schema():
-    return {"mcp_id": "orders_mongo", "collections":[{"collection":"orders","fields":["order_id","customer_id","amount","order_date"]}]}
+    return {
+        "mcp_id": "orders_mongo",
+        "db_type": "nosql",
+        "entities": [
+            {
+                "name": "orders",
+                "kind": "collection",
+                "semantic_tags": ["entity:order"],
+                "default_id_field": "order_id",
+                "fields": [
+                    {"name": "order_id", "type": "text", "semantic_tags": ["id", "order_id"]},
+                    {"name": "customer_id", "type": "text", "semantic_tags": ["customer_id"]},
+                    {"name": "amount", "type": "number", "semantic_tags": ["amount", "order_amount"]},
+                    {"name": "order_date", "type": "date", "semantic_tags": ["order_date", "timestamp"]},
+                ],
+            }
+        ],
+    }
 
 @app.post("/find")
 async def find(payload: dict):
+    print(payload)
     filter_ = payload.get("filter", {})
     limit = int(payload.get("limit", 5))
     docs = []
