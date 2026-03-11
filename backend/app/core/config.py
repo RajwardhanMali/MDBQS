@@ -13,7 +13,7 @@ class Settings:
     NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD")
     MILVUS_HOST: str = "localhost"
     MILVUS_PORT: int = 19530
-    GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
+    GROQ_API_KEY: str | None = os.getenv("GROQ_API_KEY")
     APP_ENV: str = "development"
 
     class Config:

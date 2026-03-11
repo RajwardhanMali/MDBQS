@@ -23,7 +23,7 @@ async def query_endpoint(req: QueryRequest):
     request_id = str(uuid.uuid4())
     logger.info("Received /api/v1/query user=%s nl_query=%s", req.user_id, req.nl_query)
 
-    # 1) PLAN (this is where your planner + Gemini/heuristics runs)
+    # 1) PLAN (this is where your planner + Groq/heuristics runs)
     plan_nodes = await planner.plan(req.nl_query)
     logger.info("Plan nodes: %s", [p.model_dump() for p in plan_nodes])
 

@@ -11,10 +11,10 @@ logger = logging.getLogger("groq_client")
 load_dotenv()
 
 try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
+    from groq import Groq
+    GROQ_AVAILABLE = True
 except Exception:
-    OPENAI_AVAILABLE = False
+    GROQ_AVAILABLE = False
 
 
 PLAN_PROMPT_TEMPLATE = """
@@ -51,7 +51,7 @@ Each step MUST be a JSON object with:
         "rel": "REFERRED",           // always use this unless explicitly stated
         "depth": 1                   // default traversal depth
       }}.
-  * For search: {{"embedding": [...], "top_k": N}}
+  * For search: {{"embedding": [0.1, 0.2, ...], "top_k": N}}  // embedding is an array of floats
     or {{"embedding_from": "p1.embedding", "top_k": N}}.
 - depends_on: optional id of another step whose results are needed.
 - output_alias: You MUST set output_alias for every step. Use values like "customers", "customer", "recent_orders", "referrals", "similar_customers" whenever appropriate.
@@ -63,8 +63,10 @@ Rules:
 - Only call sources that are relevant to the query.
 - If the query only needs customer details, don't call orders or graph or vector.
 - If the query needs similar customers, use the vector source if available.
+- For vector search, you MUST provide a valid embedding array of floats, not strings or IDs.
 - If you reference previous step results in input (e.g. "embedding_from"),
   use the pattern "p1.embedding" (step id followed by fields joined by dots).
+- Always ensure the input matches the expected format for each tool.
 
 User query:
 {nl_query}
@@ -78,17 +80,14 @@ Return ONLY a JSON array, no extra text.
 class GroqClient:
     def __init__(self, api_key: Optional[str] = None, mock_mode: bool = False):
         self.api_key = api_key or os.environ.get("GROQ_API_KEY")
-        self.mock_mode = mock_mode or (not OPENAI_AVAILABLE)
-        if OPENAI_AVAILABLE and not self.mock_mode:
-            self.client = OpenAI(
-                api_key=self.api_key,
-                base_url="https://api.groq.com/openai/v1"
-            )
+        self.mock_mode = mock_mode or (not GROQ_AVAILABLE)
+        if GROQ_AVAILABLE and not self.mock_mode:
+            self.client = Groq(api_key=self.api_key)
         else:
             self.client = None
         logger.info(
-            "GroqClient initialized (OPENAI_AVAILABLE=%s, mock_mode=%s)",
-            OPENAI_AVAILABLE,
+            "GroqClient initialized (GROQ_AVAILABLE=%s, mock_mode=%s)",
+            GROQ_AVAILABLE,
             self.mock_mode,
         )
 
@@ -113,7 +112,7 @@ class GroqClient:
         if self.client and not self.mock_mode:
             try:
                 resp = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="openai/gpt-oss-120b",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
                 )
@@ -132,7 +131,7 @@ class GroqClient:
 
     def _heuristic_plan(self, nl_query: str, entity_candidates: List[Dict[str, Any]]):
         """
-        Very simple deterministic fallback if Gemini is unavailable.
+        Very simple deterministic fallback if Groq is unavailable.
         We keep this minimal: basic "list customers" or "find customer" in SQL.
         """
         q = nl_query.lower()

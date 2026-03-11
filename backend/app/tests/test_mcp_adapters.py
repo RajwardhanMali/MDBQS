@@ -39,12 +39,10 @@ def test_graph_adapter():
     )
     assert r.status_code == 200
     data = r.json().get("data") or {}
-    # depending on your adapter shape, might be nodes/edges
     assert isinstance(data, dict)
 
 
 def test_vector_adapter():
-    # simple vector search with dummy embedding
     r = requests.post(
         f"{VECTOR_URL}/search",
         json={"index": "customer_embeddings", "embedding": [0.1, 0.2, 0.3], "top_k": 3},

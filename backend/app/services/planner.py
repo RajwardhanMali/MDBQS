@@ -1,9 +1,10 @@
 # app/services/planner.py
 import json
 import logging
+import os
 from typing import List, Dict, Any
 
-from app.core.llm.gemini_client import GeminiClient
+from app.core.llm.groq_client import GroqClient
 from app.models.state import PlanNode
 from app.services.schema_index import schema_index, source_schema_from_dict
 from app.services import mcp_manager
@@ -11,7 +12,7 @@ from app.services import mcp_manager
 logger = logging.getLogger("planner")
 logger.setLevel(logging.INFO)
 
-gemini = GeminiClient(api_key=None, mock_mode=False)
+groq = GroqClient(api_key=os.getenv("GROQ_API_KEY"), mock_mode=not bool(os.getenv("GROQ_API_KEY")))
 
 _SCHEMAS_LOADED = False  # module-level flag
 
@@ -82,8 +83,8 @@ async def plan(nl_query: str) -> List[PlanNode]:
     """
     Dynamic planner:
     1) Ensure schemas are loaded from MCPs (lazy).
-    2) Build 'sources' description for Gemini.
-    3) Ask Gemini for a JSON list of steps (LLM-native plan).
+    2) Build 'sources' description for Groq.
+    3) Ask Groq for a JSON list of steps (LLM-native plan).
     4) Map each step into a PlanNode (store full step JSON in subquery_nl).
     """
     # 1) make sure we have schema metadata
@@ -97,8 +98,8 @@ async def plan(nl_query: str) -> List[PlanNode]:
     # Also build simple candidates for heuristic fallback
     candidates = schema_index.discover_candidates(nl_query)
 
-    # 3) get plan from Gemini / heuristic
-    resp = await gemini.plan_query(nl_query, entity_candidates=candidates, sources=sources)
+    # 3) get plan from Groq / heuristic
+    resp = await groq.plan_query(nl_query, entity_candidates=candidates, sources=sources)
     raw_steps = resp.get("plan", []) if isinstance(resp, dict) else []
     logger.info("LLM plan steps: %s", json.dumps(raw_steps, indent=2))
 
