@@ -1,9 +1,12 @@
-import httpx
-from typing import Dict, Any, List
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from app.models.state import McpServerDescriptor
+from app.services.mcp_runtime import McpRuntime
 
 MCP_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
-# Defaults you asked to add — safe static manifests for local/dev testing
 DEFAULT_MCP_MANIFESTS: List[Dict[str, Any]] = [
     {"id": "sql_customers", "host": "http://localhost:8001", "capabilities": ["query.sql"]},
     {"id": "orders_mongo", "host": "http://localhost:8002", "capabilities": ["query.document"]},
@@ -11,59 +14,66 @@ DEFAULT_MCP_MANIFESTS: List[Dict[str, Any]] = [
     {"id": "vector_customers", "host": "http://localhost:8004", "capabilities": ["query.vector"]},
 ]
 
-# If you want the defaults to be registered automatically on import, set this to True.
-# WARNING: enabling auto-registration on import can create side-effects in tests/REPLs.
 AUTO_REGISTER_DEFAULTS_ON_IMPORT = True
+
+runtime = McpRuntime()
+
+LEGACY_OPERATION_TO_TOOL = {
+    "execute_sql": "query.sql",
+    "find": "query.document",
+    "traverse": "query.graph",
+    "search": "query.vector",
+}
+
+
+def _descriptor_from_manifest(manifest: Dict[str, Any]) -> McpServerDescriptor:
+    return McpServerDescriptor(
+        server_id=manifest["id"],
+        base_url=manifest["host"],
+        capabilities=manifest.get("capabilities", []),
+        metadata={k: v for k, v in manifest.items() if k not in {"id", "host", "capabilities"}},
+    )
 
 
 def register_mcp(manifest: Dict[str, Any]):
-    """
-    Register a single MCP manifest into the shared MCP_REGISTRY.
-
-    manifest: { id, host, capabilities: [] }
-    """
     MCP_REGISTRY[manifest["id"]] = manifest
+    runtime.register_server(_descriptor_from_manifest(manifest))
     return manifest
 
 
 def register_default_manifests():
-    """Register all DEFAULT_MCP_MANIFESTS that are not already present."""
-    for m in DEFAULT_MCP_MANIFESTS:
-        if m["id"] not in MCP_REGISTRY:
-            register_mcp(m)
+    for manifest in DEFAULT_MCP_MANIFESTS:
+        if manifest["id"] not in MCP_REGISTRY:
+            register_mcp(manifest)
 
 
-async def init_managers(settings, register_defaults: bool = False):
-    """Initialises managers. Keep heavy I/O out of import-time.
-
-    If `register_defaults` is True, default manifests will be registered as well.
-    """
-    # For now, we don't auto-register; keep the registry empty until user registers adapters or you configure defaults
+async def init_managers(settings=None, register_defaults: bool = False):
     if register_defaults:
         register_default_manifests()
-    return
+    await runtime.hydrate_all()
 
 
 async def fetch_schema(manifest: Dict[str, Any]):
-    url = manifest["host"].rstrip("/") + "/schema"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.json()
+    server_id = manifest["id"]
+    return await runtime.read_json_resource(server_id, f"schema://{server_id}")
 
 
 async def call_execute(mcp_id: str, operation: str, payload: Dict[str, Any]):
-    manifest = MCP_REGISTRY.get(mcp_id)
-    if not manifest:
-        raise RuntimeError(f"MCP {mcp_id} not registered")
-    host = manifest["host"].rstrip("/")
-    url = f"{host}/{operation.lstrip('/') }"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        return resp.json()
+    if operation == "get_schema":
+        return await runtime.read_json_resource(mcp_id, f"schema://{mcp_id}")
+
+    tool_name = LEGACY_OPERATION_TO_TOOL.get(operation, operation)
+    result = await runtime.invoke_tool(mcp_id, tool_name, payload)
+    structured = result.structured_content
+    items = structured.get("items", [])
+    meta = structured.get("meta", {})
+
+    if tool_name == "query.document":
+        return {"docs": items, "meta": meta}
+    if tool_name == "query.vector":
+        return {"matches": items, "meta": meta}
+    return {"rows": items, "meta": meta, "data": {"items": items, "meta": meta}}
 
 
-# Optionally register defaults on import (left off by default to avoid side-effects)
 if AUTO_REGISTER_DEFAULTS_ON_IMPORT:
     register_default_manifests()

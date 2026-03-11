@@ -10,14 +10,15 @@ interface QueryInputProps {
 }
 
 const QueryInput = ({ onSubmit, disabled = false }: QueryInputProps) => {
+  const composerDraft = useChatStore((state) => state.composerDraft);
+  const setComposerDraft = useChatStore((state) => state.setComposerDraft);
+  const suggestions = useChatStore((state) => state.schemaSuggestions);
+  const searchSchema = useChatStore((state) => state.searchSchema);
+  const clearSchemaSuggestions = useChatStore((state) => state.clearSchemaSuggestions);
+  const schemaLoading = useChatStore((state) => state.schemaLoading);
+
   const [value, setValue] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(-1);
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
-
-  const suggestions = useChatStore((state) => state.suggestions);
-  const fetchSuggestions = useChatStore((state) => state.fetchSuggestions);
-  const clearSuggestions = useChatStore((state) => state.clearSuggestions);
-
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const showSuggestions = suggestions.length > 0;
@@ -29,25 +30,24 @@ const QueryInput = ({ onSubmit, disabled = false }: QueryInputProps) => {
         clearTimeout(timeout);
       }
 
-      timeout = setTimeout(async () => {
-        if (query.trim().length < 2) {
-          clearSuggestions();
-          return;
-        }
-        setLoadingSuggestions(true);
-        await fetchSuggestions(query);
-        setLoadingSuggestions(false);
+      timeout = setTimeout(() => {
+        void searchSchema(query);
       }, 250);
     };
-  }, [clearSuggestions, fetchSuggestions]);
+  }, [searchSchema]);
 
   useEffect(() => {
-    const el = inputRef.current;
-    if (!el) {
+    setValue(composerDraft);
+  }, [composerDraft]);
+
+  useEffect(() => {
+    const element = inputRef.current;
+    if (!element) {
       return;
     }
-    el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+
+    element.style.height = 'auto';
+    element.style.height = `${Math.min(element.scrollHeight, 180)}px`;
   }, [value]);
 
   const submit = async () => {
@@ -59,11 +59,16 @@ const QueryInput = ({ onSubmit, disabled = false }: QueryInputProps) => {
     await onSubmit(query);
     setValue('');
     setSelectedIndex(-1);
-    clearSuggestions();
+    setComposerDraft('');
+    clearSchemaSuggestions();
   };
 
   return (
     <div className="relative mx-auto max-w-5xl">
+      <div className="mb-2 flex items-center justify-between gap-3 px-1 text-xs text-muted-foreground">
+        <span>Ask about any connected source. The reply can contain multiple result sets.</span>
+        <span>Ctrl/Cmd + K</span>
+      </div>
       <div className="relative flex items-end gap-2">
         <textarea
           ref={inputRef}
@@ -71,43 +76,46 @@ const QueryInput = ({ onSubmit, disabled = false }: QueryInputProps) => {
           rows={1}
           value={value}
           disabled={disabled}
-          onChange={(e) => {
-            const next = e.target.value;
+          onChange={(event) => {
+            const next = event.target.value;
             setValue(next);
+            setComposerDraft(next);
             setSelectedIndex(-1);
             debouncedFetch(next);
           }}
-          onKeyDown={async (e) => {
-            if (e.key === 'ArrowDown' && showSuggestions) {
-              e.preventDefault();
+          onKeyDown={async (event) => {
+            if (event.key === 'ArrowDown' && showSuggestions) {
+              event.preventDefault();
               setSelectedIndex((prev) => Math.min(prev + 1, suggestions.length - 1));
               return;
             }
 
-            if (e.key === 'ArrowUp' && showSuggestions) {
-              e.preventDefault();
+            if (event.key === 'ArrowUp' && showSuggestions) {
+              event.preventDefault();
               setSelectedIndex((prev) => Math.max(prev - 1, -1));
               return;
             }
 
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault();
               if (showSuggestions && selectedIndex >= 0) {
-                setValue(suggestions[selectedIndex].text);
-                clearSuggestions();
+                const suggestion = suggestions[selectedIndex];
+                setValue(suggestion.text);
+                setComposerDraft(suggestion.text);
+                clearSchemaSuggestions();
                 return;
               }
               await submit();
             }
 
-            if (e.key === 'Escape') {
-              clearSuggestions();
+            if (event.key === 'Escape') {
+              clearSchemaSuggestions();
               setSelectedIndex(-1);
             }
           }}
-          placeholder="Ask a question about your data..."
+          placeholder="Ask a question about your connected data sources..."
           className={cn(
-            'w-full resize-none rounded-2xl border bg-card/70 px-4 py-3 pr-12 text-sm shadow-sm backdrop-blur',
+            'w-full resize-none rounded-[1.75rem] border border-border/70 bg-card/80 px-4 py-3 pr-14 text-sm shadow-sm backdrop-blur',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
             disabled && 'opacity-70'
           )}
@@ -116,13 +124,13 @@ const QueryInput = ({ onSubmit, disabled = false }: QueryInputProps) => {
         <button
           type="button"
           disabled={disabled || !value.trim()}
-          onClick={submit}
-          className="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground disabled:opacity-50"
+          onClick={() => void submit()}
+          className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-sm disabled:opacity-50"
         >
           <Send className="h-4 w-4" />
         </button>
 
-        {loadingSuggestions && (
+        {schemaLoading && (
           <div className="absolute right-16 top-3 text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
           </div>
@@ -135,7 +143,8 @@ const QueryInput = ({ onSubmit, disabled = false }: QueryInputProps) => {
           selectedIndex={selectedIndex}
           onSelect={(suggestion) => {
             setValue(suggestion.text);
-            clearSuggestions();
+            setComposerDraft(suggestion.text);
+            clearSchemaSuggestions();
             setSelectedIndex(-1);
             inputRef.current?.focus();
           }}

@@ -1,21 +1,18 @@
-import React from 'react';
+import { ChatMessage } from '../types/apiTypes';
 import { formatDateTime } from '../utils/formatters';
 
 interface UserMessageBubbleProps {
-  content: string;
-  timestamp: number;
+  message: ChatMessage;
 }
 
-const UserMessageBubble: React.FC<UserMessageBubbleProps> = ({ content, timestamp }) => {
+const UserMessageBubble = ({ message }: UserMessageBubbleProps) => {
   return (
-    <div className="flex justify-end mb-4">
-      <div className="max-w-xs lg:max-w-md xl:max-w-lg">
-        <div className="bg-primary text-primary-foreground rounded-2xl rounded-tr-md px-4 py-3 shadow-sm">
-          <p className="text-sm break-words">{content}</p>
+    <div className="flex justify-end">
+      <div className="max-w-2xl">
+        <div className="rounded-[1.5rem] rounded-tr-md bg-primary px-4 py-3 text-sm text-primary-foreground shadow-sm">
+          <p className="break-words leading-6">{message.content}</p>
         </div>
-        <p className="text-xs text-muted-foreground mt-1 text-right">
-          {formatDateTime(timestamp)}
-        </p>
+        <p className="mt-1 text-right text-xs text-muted-foreground">{formatDateTime(message.created_at)}</p>
       </div>
     </div>
   );

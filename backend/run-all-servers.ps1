@@ -23,10 +23,10 @@ function Launch-Service ($title, $port, $appPath, $reload=$false) {
 }
 
 # Launch services
-Launch-Service "SQL_MCP"    8001 "app.mcp_plugins.mcp_sql_sample.main:app"
-Launch-Service "NoSQL_MCP"  8002 "app.mcp_plugins.mcp_nosql_sample.main:app"
-Launch-Service "Graph_MCP"  8003 "app.mcp_plugins.mcp_graph_sample.main:app"
-Launch-Service "Vector_MCP" 8004 "app.mcp_plugins.mcp_vector_sample.main:app"
+Launch-Service "SQL_MCP"    8001 "app.mcp_plugins.mcp_sql_sample.main:app" $true
+Launch-Service "NoSQL_MCP"  8002 "app.mcp_plugins.mcp_nosql_sample.main:app" $true
+Launch-Service "Graph_MCP"  8003 "app.mcp_plugins.mcp_graph_sample.main:app" $true
+Launch-Service "Vector_MCP" 8004 "app.mcp_plugins.mcp_vector_sample.main:app" $true
 Launch-Service "Backend"    8000 "app.main:app" $true
 
 Write-Host "Done. Check the new Terminal tabs." -ForegroundColor Green

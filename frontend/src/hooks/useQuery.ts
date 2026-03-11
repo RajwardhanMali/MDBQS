@@ -2,14 +2,14 @@ import { useCallback } from 'react';
 import { useChatStore } from '../store/chatStore';
 
 export const useQuery = () => {
-  const submitQuery = useChatStore((state) => state.submitQuery);
-  const loading = useChatStore((state) => state.loading);
+  const sendMessage = useChatStore((state) => state.sendMessage);
+  const loading = useChatStore((state) => state.sendingMessage);
 
   const execute = useCallback(
     async (query: string) => {
-      await submitQuery(query);
+      await sendMessage(query);
     },
-    [submitQuery]
+    [sendMessage]
   );
 
   return {

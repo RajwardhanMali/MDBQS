@@ -1,13 +1,11 @@
-# app/api/v1/query.py
-from fastapi import APIRouter
-from pydantic import BaseModel
-from typing import Any, Dict, List
 import uuid
-import logging
+from typing import Any, Dict, Optional
 
-from app.services import planner, execution, fusion
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, Field
 
-logger = logging.getLogger("api.query")
+from app.models.state import ExecutionResultSet
+from app.services import fusion
 
 router = APIRouter(prefix="/api/v1", tags=["query"])
 
@@ -15,33 +13,38 @@ router = APIRouter(prefix="/api/v1", tags=["query"])
 class QueryRequest(BaseModel):
     user_id: str
     nl_query: str
-    context: Dict[str, Any] = {}
+    context: Dict[str, Any] = Field(default_factory=dict)
+    session_id: Optional[str] = None
 
 
 @router.post("/query")
-async def query_endpoint(req: QueryRequest):
-    request_id = str(uuid.uuid4())
-    logger.info("Received /api/v1/query user=%s nl_query=%s", req.user_id, req.nl_query)
+async def query_endpoint(req: QueryRequest, request: Request):
+    chat_service = request.app.state.chat_service
+    session_id = req.session_id
+    if not session_id:
+        session = await chat_service.create_session(
+            user_id=req.user_id,
+            title=req.nl_query[:40] or "Query session",
+            source_ids=req.context.get("source_ids"),
+        )
+        session_id = session.session_id
 
-    # 1) PLAN (this is where your planner + Groq/heuristics runs)
-    plan_nodes = await planner.plan(req.nl_query)
-    logger.info("Plan nodes: %s", [p.model_dump() for p in plan_nodes])
-
-    # 2) EXECUTE
-    exec_tasks = await execution.execute_plan(plan_nodes)
-    logger.info(
-        "Execution tasks: %s",
-        [t.model_dump() for t in exec_tasks],
+    response = await chat_service.chat(
+        session_id=session_id,
+        user_id=req.user_id,
+        message=req.nl_query,
+        source_ids=req.context.get("source_ids"),
     )
-
-    # 3) FUSE
-    fused = fusion.fuse(exec_tasks, nl_query=req.nl_query)
-
+    result_sets = [ExecutionResultSet(**item) for item in response["result_sets"]]
+    fused = fusion.compatibility_fused_data(result_sets, nl_query=req.nl_query)
     return {
-        "request_id": request_id,
+        "request_id": str(uuid.uuid4()),
         "status": "COMPLETE",
-        # "plan": [p.model_dump() for p in plan_nodes],
-        # "execution_tasks": [t.model_dump() for t in exec_tasks],
         "fused_data": fused,
-        "explain": fused.get("explain", []),
+        "explain": response["explain"],
+        "answer": response["answer"],
+        "result_sets": response["result_sets"],
+        "citations": response["citations"],
+        "session_id": response["session_id"],
+        "message_id": response["message_id"],
     }

@@ -1,264 +1,222 @@
-# app/services/execution.py
 import json
-import uuid
 import logging
-from typing import List, Dict, Any, Optional
+import uuid
+from typing import Any, Dict, List, Optional
 
-from app.models.state import PlanNode, ExecutionTask
+from app.models.state import ExecutionResultSet, ExecutionTask, PlanNode, PlanStep, SourceMeta
 from app.services import mcp_manager
 
 logger = logging.getLogger("execution")
 logger.setLevel(logging.INFO)
 
 
-def _resolve_ref(results_by_id: Dict[str, ExecutionTask], ref: str) -> Any:
-    """
-    Resolve a reference like "p1.embedding" or "p1.customer.embedding"
-    into an actual value from previous ExecutionTask results.
-    """
+def _resolve_ref(results_by_id: Dict[str, ExecutionResultSet], ref: str) -> Any:
     if not ref:
         return None
 
     parts = ref.split(".")
-    step_id = parts[0]
-    task = results_by_id.get(step_id)
-    if not task or not task.result:
-        logger.warning(f"Cannot resolve ref {ref}: step {step_id} not found or has no results")
+    result_set = results_by_id.get(parts[0])
+    if not result_set or not result_set.items:
         return None
 
-    value: Any = task.result[0] if task.result else None
-    if value is None:
-        logger.warning(f"Cannot resolve ref {ref}: step {step_id} has empty results")
-        return None
-    
+    value: Any = result_set.items[0]
     for key in parts[1:]:
         if isinstance(value, dict):
             value = value.get(key)
-            if value is None:
-                logger.warning(f"Cannot resolve ref {ref}: key '{key}' not found")
-                return None
         else:
-            logger.warning(f"Cannot resolve ref {ref}: value is not a dict at key '{key}'")
             return None
-    
-    logger.info(f"Resolved ref {ref} to value of type {type(value)}")
     return value
 
 
-def _extract_rows(res: Any) -> List[Dict[str, Any]]:
-    """
-    Normalize different MCP result shapes into a list[dict].
-    Expected typical shapes:
-      { "rows": [...], "meta": {...} }
-      { "docs": [...], "meta": {...} }
-      { "matches": [...], "meta": {...} }
-      { "data": [...], "meta": {...} }
-      or just a list.
-    """
-    if isinstance(res, list):
-        return res
-
-    if not isinstance(res, dict):
-        return []
-
-    if "rows" in res:
-        return res["rows"]
-    if "docs" in res:
-        return res["docs"]
-    if "matches" in res:
-        return res["matches"]
-    if "data" in res:
-        return res["data"]
-    return []
+def _normalize_error_meta(
+    error: str,
+    *,
+    source_id: str,
+    source_type: str,
+    error_code: Optional[str] = None,
+    recoverable: bool = True,
+) -> Dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "source_type": source_type,
+        "error": error,
+        "error_code": error_code or "EXECUTION_ERROR",
+        "recoverable": recoverable,
+    }
 
 
-def _extract_meta(res: Any) -> Dict[str, Any]:
-    if isinstance(res, dict):
-        return res.get("meta", {}) or {}
-    return {}
+def _validate_tool_arguments(step: PlanStep, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if step.tool_name != "query.vector":
+        return None
+
+    embedding = arguments.get("embedding")
+    if embedding is None:
+        return _normalize_error_meta(
+            "A valid embedding was not available for the vector search step.",
+            source_id=step.server_id,
+            source_type=step.tool_name,
+            error_code="INVALID_VECTOR_INPUT",
+            recoverable=True,
+        )
+    if not isinstance(embedding, list) or len(embedding) != 3:
+        return _normalize_error_meta(
+            "Embedding must have dimension 3",
+            source_id=step.server_id,
+            source_type=step.tool_name,
+            error_code="INVALID_VECTOR_INPUT",
+            recoverable=True,
+        )
+    return None
+
+
+async def execute_plan_steps(plan_steps: List[PlanStep]) -> tuple[List[ExecutionResultSet], List[Dict[str, Any]]]:
+    result_sets: List[ExecutionResultSet] = []
+    results_by_id: Dict[str, ExecutionResultSet] = {}
+    tool_calls: List[Dict[str, Any]] = []
+    output_keys_by_step_id = {step.id: step.output_key for step in plan_steps}
+
+    for step in plan_steps:
+        arguments = dict(step.arguments)
+        if step.depends_on and step.depends_on not in results_by_id:
+            if step.optional:
+                continue
+            result_sets.append(
+                ExecutionResultSet(
+                    key=step.output_key,
+                    server_id=step.server_id,
+                    tool_name=step.tool_name,
+                    items=[],
+                    meta=_normalize_error_meta(
+                        f"Dependency {step.depends_on} missing",
+                        source_id=step.server_id,
+                        source_type=step.tool_name,
+                        error_code="MISSING_DEPENDENCY",
+                        recoverable=False,
+                    ),
+                )
+            )
+            continue
+
+        for key, value in list(arguments.items()):
+            if key.endswith("_from"):
+                resolved = _resolve_ref(results_by_id, _normalize_ref(value, output_keys_by_step_id))
+                arguments[key[:-5]] = resolved
+                arguments.pop(key)
+
+        validation_error = _validate_tool_arguments(step, arguments)
+        if validation_error:
+            result_set = ExecutionResultSet(
+                key=step.output_key,
+                server_id=step.server_id,
+                tool_name=step.tool_name,
+                items=[],
+                meta=validation_error,
+            )
+            result_sets.append(result_set)
+            results_by_id[step.id] = result_set
+            tool_calls.append(
+                {
+                    "step_id": step.id,
+                    "server_id": step.server_id,
+                    "tool_name": step.tool_name,
+                    "arguments": arguments,
+                    "item_count": 0,
+                    "meta": validation_error,
+                }
+            )
+            continue
+
+        try:
+            result = await mcp_manager.runtime.invoke_tool(step.server_id, step.tool_name, arguments)
+            structured = result.structured_content
+            items = structured.get("items", [])
+            meta = structured.get("meta", {})
+        except Exception as exc:
+            logger.exception("MCP tool call failed for %s.%s", step.server_id, step.tool_name)
+            items = []
+            meta = _normalize_error_meta(
+                str(exc),
+                source_id=step.server_id,
+                source_type=step.tool_name,
+            )
+
+        if meta.get("error") and "error_code" not in meta:
+            meta = _normalize_error_meta(
+                meta["error"],
+                source_id=meta.get("source_id", step.server_id),
+                source_type=meta.get("source_type", step.tool_name),
+                error_code="INVALID_VECTOR_INPUT" if step.tool_name == "query.vector" and "dimension 3" in meta["error"] else "EXECUTION_ERROR",
+                recoverable=True,
+            ) | {k: v for k, v in meta.items() if k not in {"error", "error_code", "recoverable", "source_id", "source_type"}}
+
+        result_set = ExecutionResultSet(
+            key=step.output_key,
+            server_id=step.server_id,
+            tool_name=step.tool_name,
+            items=items,
+            meta=meta,
+        )
+        result_sets.append(result_set)
+        results_by_id[step.id] = result_set
+        tool_calls.append(
+            {
+                "step_id": step.id,
+                "server_id": step.server_id,
+                "tool_name": step.tool_name,
+                "arguments": arguments,
+                "item_count": len(items),
+                "meta": meta,
+            }
+        )
+
+    return result_sets, tool_calls
+
+
+def _normalize_ref(ref: str, output_keys_by_step_id: Dict[str, str]) -> str:
+    if not ref:
+        return ref
+    parts = ref.split(".")
+    if len(parts) == 2:
+        step_id, field = parts
+        output_key = output_keys_by_step_id.get(step_id)
+        if output_key and field == output_key:
+            return f"{step_id}.embedding"
+    return ref
 
 
 async def execute_plan(plan_nodes: List[PlanNode]) -> List[ExecutionTask]:
-    """
-    Execute LLM-native plan nodes with comprehensive logging.
-    """
-    tasks: List[ExecutionTask] = []
-    results_by_id: Dict[str, ExecutionTask] = {}
-
-    logger.info("=" * 70)
-    logger.info(f"EXECUTION START: {len(plan_nodes)} plan nodes to execute")
-    logger.info("=" * 70)
-
-    for idx, node in enumerate(plan_nodes):
-        logger.info(f"\n{'='*70}")
-        logger.info(f"STEP {idx+1}/{len(plan_nodes)}: Processing node {node.id}")
-        logger.info(f"{'='*70}")
-        
-        try:
-            step = json.loads(node.subquery_nl) if node.subquery_nl else {}
-            logger.info(f"Parsed step: {json.dumps(step, indent=2)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse step JSON for node {node.id}: {e}")
-            step = {}
-        
-        step_id = step.get("id", node.id)
-        mcp_id = step.get("mcp_id") or node.preferred
-        tool = step.get("tool", "")
-        db_type = (step.get("db_type") or "").lower()
-        input_payload: Dict[str, Any] = step.get("input") or {}
-        depends_on = step.get("depends_on") or node.depends_on
-        output_alias = step.get("output_alias")
-        is_optional = step.get("optional", False)
-
-        logger.info(f"Step details:")
-        logger.info(f"  - step_id: {step_id}")
-        logger.info(f"  - mcp_id: {mcp_id}")
-        logger.info(f"  - tool: {tool}")
-        logger.info(f"  - db_type: {db_type}")
-        logger.info(f"  - depends_on: {depends_on}")
-        logger.info(f"  - optional: {is_optional}")
-        logger.info(f"  - output_alias: {output_alias}")
-
-        # Check dependency BEFORE resolving references
-        if depends_on:
-            dep_task = results_by_id.get(depends_on)
-            if not dep_task:
-                logger.warning(f"⚠️  Dependency {depends_on} not found in results")
-                if is_optional:
-                    logger.info(f"⏭️  Skipping optional step {step_id}")
-                    continue
-                else:
-                    logger.error(f"❌ Required dependency {depends_on} missing!")
-                    task = ExecutionTask(
-                        task_id=str(uuid.uuid4()),
-                        plan_node_id=step_id,
-                        source=mcp_id,
-                        native_query=str(input_payload),
-                        result=[],
-                        meta={
-                            "source_id": mcp_id,
-                            "source_type": node.capability,
-                            "last_updated": None,
-                            "output_alias": output_alias,
-                            "extra": {"error": f"Dependency {depends_on} not found"},
-                        },
-                    )
-                    tasks.append(task)
-                    results_by_id[step_id] = task
-                    continue
-            
-            if not dep_task.result:
-                logger.warning(f"⚠️  Dependency {depends_on} has no results")
-                if is_optional:
-                    logger.info(f"⏭️  Skipping optional step {step_id}")
-                    continue
-                else:
-                    logger.warning(f"⚠️  Proceeding despite empty dependency")
-
-        # Resolve any *_from references in input
-        input_payload_copy = input_payload.copy()
-        resolved_refs = []
-        
-        for key, value in input_payload.items():
-            if isinstance(key, str) and key.endswith("_from"):
-                ref_value = _resolve_ref(results_by_id, value)
-                actual_key = key[:-5]  # Remove "_from" suffix
-                if ref_value is not None:
-                    input_payload_copy[actual_key] = ref_value
-                    resolved_refs.append(f"{key}={value} -> {actual_key}={type(ref_value).__name__}")
-                else:
-                    logger.warning(f"⚠️  Could not resolve reference {key}={value}")
-                input_payload_copy.pop(key)
-        
-        if resolved_refs:
-            logger.info(f"✅ Resolved references:")
-            for ref in resolved_refs:
-                logger.info(f"   - {ref}")
-        
-        input_payload = input_payload_copy
-
-        # Infer tool if not specified
-        if not tool:
-            cap = (node.capability or "").lower()
-            if cap == "query.sql" or db_type == "sql":
-                tool = "execute_sql"
-            elif cap == "query.document" or db_type == "nosql":
-                tool = "find"
-            elif cap == "query.graph" or db_type == "graph":
-                tool = "traverse"
-            elif cap == "query.vector" or db_type == "vector":
-                tool = "search"
-            else:
-                tool = "execute_sql"
-            logger.info(f"🔧 Inferred tool={tool} from capability={cap}, db_type={db_type}")
-
-        # Execute the MCP call
-        logger.info(f"📞 Calling MCP: {mcp_id}.{tool}")
-        logger.info(f"📦 Payload: {json.dumps(input_payload, indent=2)}")
-        
-        try:
-            res = await mcp_manager.call_execute(mcp_id, tool, input_payload)
-            logger.info(f"✅ MCP call succeeded, response type: {type(res)}")
-        except Exception as e:
-            logger.exception(f"❌ MCP call failed: {e}")
-            task = ExecutionTask(
-                task_id=str(uuid.uuid4()),
-                plan_node_id=step_id,
-                source=mcp_id,
-                native_query=str(input_payload),
-                result=[],
-                meta={
-                    "source_id": mcp_id,
-                    "source_type": node.capability,
-                    "last_updated": None,
-                    "output_alias": output_alias,
-                    "extra": {"error": str(e)},
-                },
+    plan_steps: List[PlanStep] = []
+    for node in plan_nodes:
+        step = json.loads(node.subquery_nl)
+        plan_steps.append(
+            PlanStep(
+                id=step["id"],
+                description=step["description"],
+                server_id=step["server_id"],
+                tool_name=step["tool_name"],
+                arguments=step.get("arguments", {}),
+                depends_on=step.get("depends_on"),
+                output_key=step.get("output_key", step["id"]),
+                optional=step.get("optional", False),
             )
-            tasks.append(task)
-            results_by_id[step_id] = task
-            continue
-
-        rows = _extract_rows(res)
-        meta = _extract_meta(res)
-        
-        logger.info(f"📊 Extracted {len(rows)} rows from response")
-        if rows:
-            logger.info(f"📝 First row sample: {json.dumps(rows[0], default=str)[:200]}...")
-
-        native_query = input_payload.get("query") or f"{tool}({json.dumps(input_payload)})"
-
-        # Merge meta information
-        meta_source_id = meta.get("source_id") or mcp_id
-        meta_source_type = meta.get("source_type") or node.capability
-        meta_last_updated = meta.get("last_updated")
-        extra_meta = {k: v for k, v in meta.items() 
-                     if k not in ("source_id", "source_type", "last_updated")}
-        
-        if extra_meta.get("error"):
-            logger.error(f"❌ MCP returned error in meta: {extra_meta['error']}")
-
-        task = ExecutionTask(
-            task_id=str(uuid.uuid4()),
-            plan_node_id=step_id,
-            source=mcp_id,
-            native_query=native_query,
-            result=rows,
-            meta={
-                "source_id": meta_source_id,
-                "source_type": meta_source_type,
-                "last_updated": meta_last_updated,
-                "output_alias": output_alias,
-                "extra": extra_meta,
-            },
         )
 
-        tasks.append(task)
-        results_by_id[step_id] = task
-        logger.info(f"✅ Step {step_id} completed: {len(rows)} results stored")
-
-    logger.info("\n" + "=" * 70)
-    logger.info(f"EXECUTION COMPLETE: {len(tasks)}/{len(plan_nodes)} tasks executed")
-    logger.info("=" * 70 + "\n")
-    
+    result_sets, _tool_calls = await execute_plan_steps(plan_steps)
+    tasks: List[ExecutionTask] = []
+    for result_set in result_sets:
+        tasks.append(
+            ExecutionTask(
+                task_id=str(uuid.uuid4()),
+                plan_node_id=result_set.key,
+                source=result_set.server_id,
+                native_query=json.dumps({"tool": result_set.tool_name}),
+                result=result_set.items,
+                meta=SourceMeta(
+                    source_id=result_set.server_id,
+                    source_type=result_set.tool_name,
+                    output_alias=result_set.key,
+                    extra=result_set.meta,
+                ),
+            )
+        )
     return tasks

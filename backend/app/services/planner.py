@@ -1,135 +1,291 @@
-# app/services/planner.py
 import json
 import logging
 import os
-from typing import List, Dict, Any
+import re
+from typing import Any, Dict, List, Optional
 
 from app.core.llm.groq_client import GroqClient
-from app.models.state import PlanNode
-from app.services.schema_index import schema_index, source_schema_from_dict
+from app.models.state import ChatMessageRecord, PlanNode, PlanStep
 from app.services import mcp_manager
+from app.services.schema_index import schema_index, source_schema_from_dict
 
 logger = logging.getLogger("planner")
 logger.setLevel(logging.INFO)
 
 groq = GroqClient(api_key=os.getenv("GROQ_API_KEY"), mock_mode=not bool(os.getenv("GROQ_API_KEY")))
 
-_SCHEMAS_LOADED = False  # module-level flag
+_SCHEMAS_LOADED = False
 
 
 async def _ensure_schemas_loaded() -> None:
-    """
-    Lazy-load schemas from all registered MCPs into schema_index.
-
-    If MCP_REGISTRY is empty (common when running scripts like test.py
-    without FastAPI startup), we also register default MCP manifests here.
-    """
     global _SCHEMAS_LOADED
 
     if _SCHEMAS_LOADED and schema_index.schemas:
         return
 
-    # If no MCPs registered yet, register some defaults (for local dev)
-    if not mcp_manager.MCP_REGISTRY:
-        logger.info("MCP_REGISTRY is empty; registering default local MCPs...")
-        DEFAULT_MCPS = [
-            {"id": "sql_customers", "host": "http://localhost:8001", "capabilities": ["query.sql"]},
-            {"id": "orders_mongo", "host": "http://localhost:8002", "capabilities": ["query.document"]},
-            {"id": "graph_referrals", "host": "http://localhost:8003", "capabilities": ["query.graph"]},
-            {"id": "vector_customers", "host": "http://localhost:8004", "capabilities": ["query.vector"]},
-        ]
-        for manifest in DEFAULT_MCPS:
-            mcp_manager.register_mcp(manifest)
+    if not mcp_manager.MCP_REGISTRY and not mcp_manager.runtime.list_servers():
+        mcp_manager.register_default_manifests()
 
-    if not mcp_manager.MCP_REGISTRY:
-        logger.warning("MCP_REGISTRY still empty; no schemas to load.")
-        _SCHEMAS_LOADED = True
-        return
-
-    logger.info("Loading schemas from MCPs into schema_index...")
-    for mcp_id in mcp_manager.MCP_REGISTRY.keys():
+    server_ids = list(mcp_manager.MCP_REGISTRY.keys()) or [server.server_id for server in mcp_manager.runtime.list_servers()]
+    for mcp_id in server_ids:
         try:
-            logger.info("Fetching schema from MCP %s", mcp_id)
-            schema_json = await mcp_manager.call_execute(mcp_id, "get_schema", {})
-            logger.info("Schema from %s: %s", mcp_id, schema_json)
-            schema = source_schema_from_dict(schema_json)
-            schema_index.register_schema(schema)
-        except Exception as e:
-            logger.exception("Failed to fetch schema for %s: %s", mcp_id, e)
+            schema_json = await mcp_manager.runtime.read_json_resource(mcp_id, f"schema://{mcp_id}")
+            schema_index.register_schema(source_schema_from_dict(schema_json))
+        except Exception:
+            logger.exception("Failed to fetch schema for %s", mcp_id)
 
     _SCHEMAS_LOADED = True
-    logger.info("Schema loading complete. Schemas: %s", list(schema_index.schemas.keys()))
 
 
-def _capability_from_tool(db_type: str, tool: str) -> str:
-    """
-    Map (db_type, tool) to the legacy capability string used by PlanNode.
-    """
-    tool = (tool or "").lower()
-    db_type = (db_type or "").lower()
+async def plan(
+    nl_query: str,
+    recent_messages: Optional[List[ChatMessageRecord]] = None,
+    session_summary: str = "",
+    selected_sources: Optional[List[str]] = None,
+) -> List[PlanNode]:
+    steps = await plan_steps(
+        nl_query=nl_query,
+        recent_messages=recent_messages,
+        session_summary=session_summary,
+        selected_sources=selected_sources,
+    )
+    return [
+        PlanNode(
+            id=step.id,
+            type=step.description,
+            subquery_nl=step.model_dump_json(),
+            capability=step.tool_name,
+            preferred=step.server_id,
+            depends_on=step.depends_on,
+        )
+        for step in steps
+    ]
 
-    if tool == "execute_sql" or db_type == "sql":
-        return "query.sql"
-    if tool == "find" or db_type == "nosql":
-        return "query.document"
-    if tool == "traverse" or db_type == "graph":
-        return "query.graph"
-    if tool == "search" or db_type == "vector":
-        return "query.vector"
-    return "query.sql"
 
+async def plan_steps(
+    nl_query: str,
+    recent_messages: Optional[List[ChatMessageRecord]] = None,
+    session_summary: str = "",
+    selected_sources: Optional[List[str]] = None,
+) -> List[PlanStep]:
+    await _ensure_schemas_loaded()
 
-async def plan(nl_query: str) -> List[PlanNode]:
-    """
-    Dynamic planner:
-    1) Ensure schemas are loaded from MCPs (lazy).
-    2) Build 'sources' description for Groq.
-    3) Ask Groq for a JSON list of steps (LLM-native plan).
-    4) Map each step into a PlanNode (store full step JSON in subquery_nl).
-    """
-    # 1) make sure we have schema metadata
-    if not schema_index.schemas:
-        await _ensure_schemas_loaded()
-
-    # 2) build sources for LLM
     sources = schema_index.build_sources_for_llm()
-    logger.info("Planner LLM sources: %s", json.dumps(sources, indent=2))
+    if selected_sources:
+        sources = [source for source in sources if source["mcp_id"] in selected_sources]
 
-    # Also build simple candidates for heuristic fallback
-    candidates = schema_index.discover_candidates(nl_query)
-
-    # 3) get plan from Groq / heuristic
-    resp = await groq.plan_query(nl_query, entity_candidates=candidates, sources=sources)
+    resp = await groq.plan_chat_query(
+        nl_query=nl_query,
+        sources=sources,
+        recent_messages=recent_messages or [],
+        session_summary=session_summary,
+    )
     raw_steps = resp.get("plan", []) if isinstance(resp, dict) else []
-    logger.info("LLM plan steps: %s", json.dumps(raw_steps, indent=2))
-
-    plan_nodes: List[PlanNode] = []
+    plan_steps: List[PlanStep] = []
+    normalized_ids: Dict[Any, str] = {}
+    output_key_to_id: Dict[str, str] = {}
 
     for step in raw_steps:
         try:
-            step_id = step["id"]
-            mcp_id = step["mcp_id"]
-            db_type = step.get("db_type", "")
-            tool = step.get("tool", "")
-            desc = step.get("description") or step.get("intent") or "step"
+            raw_id = step.get("id")
+            step_id = _normalize_step_id(raw_id)
+            normalized_ids[raw_id] = step_id
+            if step.get("output_key"):
+                output_key_to_id[step["output_key"]] = step_id
 
-            capability = _capability_from_tool(db_type, tool)
+            depends_on = step.get("depends_on")
+            if isinstance(depends_on, list):
+                depends_on = depends_on[0] if depends_on else None
+            elif depends_on == "":
+                depends_on = None
+            if depends_on is not None:
+                depends_on = _normalize_reference_target(depends_on, normalized_ids, output_key_to_id)
 
-            # Store the entire step JSON in subquery_nl so execution can see tool/input/etc.
-            step_json = json.dumps(step)
-
-            pn = PlanNode(
-                id=step_id,
-                type=desc,
-                subquery_nl=step_json,
-                capability=capability,
-                target_candidates=[],
-                preferred=mcp_id,
-                depends_on=step.get("depends_on"),
+            server_id = step.get("server_id") or step.get("mcp_id")
+            tool_name = step.get("tool_name") or step.get("tool")
+            arguments = _normalize_arguments(
+                step.get("arguments") or step.get("input") or {},
+                tool_name,
+                normalized_ids,
+                output_key_to_id,
             )
-            plan_nodes.append(pn)
-        except Exception as e:
-            logger.exception("Invalid plan step from LLM, skipping: %s", e)
 
-    logger.info("Final PlanNodes: %s", [p.model_dump() for p in plan_nodes])
-    return plan_nodes
+            plan_steps.append(
+                PlanStep(
+                    id=step_id,
+                    description=step["description"],
+                    server_id=server_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    depends_on=depends_on,
+                    output_key=step.get("output_key", step_id),
+                    optional=step.get("optional", False),
+                )
+            )
+        except Exception:
+            logger.exception("Invalid plan step from planner response: %s", json.dumps(step))
+
+    plan_steps = _repair_plan_steps(nl_query, plan_steps, sources)
+    return plan_steps
+
+
+def _repair_plan_steps(nl_query: str, steps: List[PlanStep], sources: List[Dict[str, Any]]) -> List[PlanStep]:
+    q = nl_query.lower()
+
+    def source_by_tool(tool_name: str) -> Optional[str]:
+        for source in sources:
+            if tool_name in source.get("tools", []):
+                return source["mcp_id"]
+        return None
+
+    is_similarity_query = any(term in q for term in ["similar", "alike", "closest"])
+    is_referral_query = any(term in q for term in ["referral", "referrals", "referal", "referals", "referred"])
+
+    if is_similarity_query:
+        has_vector = any(step.tool_name == "query.vector" for step in steps)
+        embedding_step = next(
+            (
+                step
+                for step in steps
+                if step.tool_name == "query.sql"
+                and (
+                    "embedding" in json.dumps(step.arguments).lower()
+                    or "embedding" in step.output_key.lower()
+                )
+            ),
+            None,
+        )
+        vector_server = source_by_tool("query.vector")
+        if embedding_step and not has_vector and vector_server:
+            steps.append(
+                PlanStep(
+                    id=f"{embedding_step.id}_similarity",
+                    description="Search for similar entities from the retrieved embedding",
+                    server_id=vector_server,
+                    tool_name="query.vector",
+                    arguments={"embedding_from": f"{embedding_step.id}.embedding", "top_k": 3},
+                    depends_on=embedding_step.id,
+                    output_key="similar_customers",
+                    optional=False,
+                )
+            )
+
+    if is_referral_query and not steps:
+        graph_server = source_by_tool("query.graph")
+        customer_id = _extract_identifier(q) or "cust010"
+        if graph_server:
+            steps.append(
+                PlanStep(
+                    id="p1",
+                    description="Traverse graph referrals",
+                    server_id=graph_server,
+                    tool_name="query.graph",
+                    arguments={"start": {"property": "id", "value": customer_id}, "depth": 2},
+                    depends_on=None,
+                    output_key="referrals",
+                    optional=False,
+                )
+            )
+
+    if is_referral_query and steps:
+        graph_server = source_by_tool("query.graph")
+        customer_id = _extract_identifier(q) or "cust010"
+        if graph_server:
+            return [
+                PlanStep(
+                    id="p1",
+                    description="Traverse graph referrals",
+                    server_id=graph_server,
+                    tool_name="query.graph",
+                    arguments={"start": {"property": "id", "value": customer_id}, "depth": 2},
+                    depends_on=None,
+                    output_key="referrals",
+                    optional=False,
+                )
+            ]
+
+    return steps
+
+
+def _extract_identifier(text: str) -> Optional[str]:
+    match = re.search(r"\bcust\d+\b", text)
+    return match.group(0) if match else None
+
+
+def _normalize_step_id(value: Any) -> str:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, int):
+        return f"p{value}"
+    return "p1"
+
+
+def _normalize_arguments(
+    arguments: Dict[str, Any],
+    tool_name: Optional[str],
+    normalized_ids: Dict[Any, str],
+    output_key_to_id: Dict[str, str],
+) -> Dict[str, Any]:
+    normalized = dict(arguments)
+
+    if tool_name == "query.sql":
+        if "sql" in normalized and "query" not in normalized:
+            normalized["query"] = normalized.pop("sql")
+
+    if tool_name == "query.graph":
+        if "query" in normalized and "cypher" not in normalized:
+            normalized["cypher"] = normalized.pop("query")
+
+    if tool_name == "query.vector":
+        if "query_vector" in normalized and "embedding" not in normalized and "embedding_from" not in normalized:
+            query_vector = normalized.pop("query_vector")
+            if isinstance(query_vector, str):
+                placeholder_match = re.fullmatch(r"\$\{(.+)\}", query_vector.strip())
+                if placeholder_match:
+                    normalized["embedding_from"] = _normalize_reference(
+                        placeholder_match.group(1).strip(),
+                        normalized_ids,
+                        output_key_to_id,
+                    )
+                else:
+                    normalized["embedding"] = query_vector
+            else:
+                normalized["embedding"] = query_vector
+        if "vector" in normalized and "embedding" not in normalized:
+            vector_value = normalized.pop("vector")
+            if isinstance(vector_value, str):
+                match = re.fullmatch(r"\{\{(.+)\}\}", vector_value.strip())
+                if match:
+                    ref = match.group(1).strip()
+                    normalized["embedding_from"] = _normalize_reference(ref, normalized_ids, output_key_to_id)
+                else:
+                    normalized["embedding"] = vector_value
+            else:
+                normalized["embedding"] = vector_value
+        if "index" in normalized and "collection" not in normalized:
+            normalized["collection"] = normalized.pop("index")
+
+    for key, value in list(normalized.items()):
+        if isinstance(value, str) and value.startswith("{{") and value.endswith("}}"):
+            normalized[key] = _normalize_reference(value[2:-2].strip(), normalized_ids, output_key_to_id)
+
+    return normalized
+
+
+def _normalize_reference(value: str, normalized_ids: Dict[Any, str], output_key_to_id: Dict[str, str]) -> str:
+    if "." in value:
+        prefix, suffix = value.split(".", 1)
+        normalized_prefix = _normalize_reference_target(prefix, normalized_ids, output_key_to_id)
+        return f"{normalized_prefix}.{suffix}"
+    normalized_prefix = _normalize_reference_target(value, normalized_ids, output_key_to_id)
+    return f"{normalized_prefix}.embedding"
+
+
+def _normalize_reference_target(value: Any, normalized_ids: Dict[Any, str], output_key_to_id: Dict[str, str]) -> str:
+    if value in normalized_ids:
+        return normalized_ids[value]
+    if isinstance(value, str) and value in output_key_to_id:
+        return output_key_to_id[value]
+    if str(value).isdigit():
+        return _normalize_step_id(int(value))
+    return str(value)

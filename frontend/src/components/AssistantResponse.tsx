@@ -1,64 +1,59 @@
-import { useMemo } from 'react';
-import { QueryResponse } from '../types/apiTypes';
-import CustomerCard from './CustomerCard';
-import { CustomersTable } from './CustomersTable';
-import { OrdersTable } from './OrdersTable';
-import { OrdersChart } from './OrdersChart';
-import ReferralsTable from './ReferralsTable';
-import SimilarCustomersList from './SimilarCustomersList';
-import ExplainChips from './ExplainChips';
-import ProvenanceDrawer from './ProvenanceDrawer';
+import { ChatMessage } from '../types/apiTypes';
+import ResultSetRenderer from './ResultSetRenderer';
+import TraceViewer from './TraceViewer';
 
 interface AssistantResponseProps {
-  result: QueryResponse;
+  message: ChatMessage;
 }
 
-const AssistantResponse = ({ result }: AssistantResponseProps) => {
-  const fused = result.fused_data ?? {};
-
-  const explain = useMemo(
-    () => fused.explain ?? result.explain ?? [],
-    [fused.explain, result.explain]
-  );
-
-  const customer =
-    fused.customer &&
-    (Boolean(fused.customer.id) ||
-      Boolean(fused.customer.customer_id) ||
-      Boolean(fused.customer.name) ||
-      Boolean(fused.customer.email))
-      ? fused.customer
-      : undefined;
-  const customers = fused.customers ?? [];
-  const recentOrders = fused.recent_orders ?? [];
-  const referrals = fused.referrals ?? [];
-  const similar = fused.similar_customers ?? [];
-
-  const hasAnyData = Boolean(customer) || customers.length > 0 || recentOrders.length > 0 || referrals.length > 0 || similar.length > 0;
+const AssistantResponse = ({ message }: AssistantResponseProps) => {
+  const payload = message.answer_payload;
+  if (!payload) {
+    return null;
+  }
 
   return (
     <div className="mt-3 space-y-4">
-      {customer && <CustomerCard customer={customer} />}
-
-      {customers.length > 0 && <CustomersTable customers={customers} />}
-
-      {recentOrders.length > 0 && (
-        <div className="space-y-3 rounded-xl border bg-card/70 p-4">
-          <h3 className="text-sm font-semibold">Recent Orders</h3>
-          <OrdersTable orders={recentOrders} />
-          <OrdersChart orders={recentOrders} />
+      {payload.result_sets.length > 0 ? (
+        payload.result_sets.map((resultSet) => <ResultSetRenderer key={`${message.message_id}-${resultSet.key}`} resultSet={resultSet} />)
+      ) : (
+        <div className="rounded-2xl border border-border/70 bg-card/70 px-4 py-3 text-sm text-muted-foreground">
+          {payload.trace.errors.length > 0 ? 'The assistant returned no result sets because the request failed.' : 'No matching data was returned.'}
         </div>
       )}
 
-      {referrals.length > 0 && <ReferralsTable data={referrals} />}
+      {(payload.citations.length > 0 || payload.explain.length > 0) && (
+        <div className="rounded-2xl border border-border/70 bg-card/70 p-4 shadow-sm">
+          {payload.citations.length > 0 && (
+            <div>
+              <p className="text-xs uppercase tracking-[0.22em] text-muted-foreground">Citations</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {payload.citations.map((citation) => (
+                  <span
+                    key={`${citation.server_id}-${citation.tool_name}-${citation.key}`}
+                    className="rounded-full border border-border/70 bg-background px-3 py-1 text-xs text-muted-foreground"
+                  >
+                    {citation.server_id} via {citation.tool_name} ({citation.count} rows)
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
 
-      {similar.length > 0 && <SimilarCustomersList customers={similar} />}
+          {payload.explain.length > 0 && (
+            <details className="mt-4 rounded-2xl border border-border/70 bg-background/60 px-4 py-3" open>
+              <summary className="cursor-pointer text-sm font-medium text-foreground">How this was answered</summary>
+              <ul className="mt-3 space-y-2 text-sm text-muted-foreground">
+                {payload.explain.map((line, index) => (
+                  <li key={`${message.message_id}-explain-${index}`}>{line}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
 
-      {explain.length > 0 && <ExplainChips chips={explain} />}
-
-      <ProvenanceDrawer data={fused.provenance} />
-
-      {!hasAnyData && <div className="rounded-xl border bg-card/60 p-4 text-sm text-muted-foreground">No results found for this query.</div>}
+      <TraceViewer messageId={message.message_id} initialTrace={payload.trace} />
     </div>
   );
 };

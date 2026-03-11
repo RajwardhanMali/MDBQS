@@ -1,8 +1,8 @@
-# app/services/schema_index.py
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
 import logging
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("schema_index")
 
@@ -17,30 +17,24 @@ class FieldInfo:
 
 @dataclass
 class EntityInfo:
-    name: str                      # e.g. "customers", "orders"
-    kind: str                      # e.g. "table","collection","node","index"
+    name: str
+    kind: str
     fields: List[FieldInfo]
-    semantic_tags: List[str] = field(default_factory=list)  # e.g. ["entity:customer"]
-    default_id_field: Optional[str] = None                  # e.g. "id","customer_id"
+    semantic_tags: List[str] = field(default_factory=list)
+    default_id_field: Optional[str] = None
 
 
 @dataclass
 class SourceSchema:
-    mcp_id: str                    # e.g. "sql_customers"
-    db_type: str                   # "sql","nosql","graph","vector"
+    mcp_id: str
+    db_type: str
     entities: List[EntityInfo]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class SchemaIndex:
-    """
-    In-memory catalog of MCP schemas.
-    This is what the planner consults to decide what exists.
-    """
-
     def __init__(self):
         self.schemas: Dict[str, SourceSchema] = {}
-
-    # -------- registration -------- #
 
     def register_schema(self, schema: SourceSchema) -> None:
         logger.info("Registering schema for MCP %s (db_type=%s)", schema.mcp_id, schema.db_type)
@@ -49,34 +43,28 @@ class SchemaIndex:
     def clear(self) -> None:
         self.schemas.clear()
 
-    # -------- discovery / search -------- #
-
     def discover_candidates(self, nl_query: str) -> List[Dict[str, Any]]:
-        """
-        Given an NL query, return candidate (mcp_id, entity_name, fields, score, tags, db_type)
-        that look relevant. (Used only by heuristic fallback now.)
-        """
         q = nl_query.lower()
         matches: List[Dict[str, Any]] = []
 
         for source in self.schemas.values():
             for ent in source.entities:
                 score = 0
+                if ent.name.lower() in q:
+                    score += 4
 
-                # very simple lexical scoring; you can improve later
-                if "customer" in q and any("entity:customer" == t for t in ent.semantic_tags):
-                    score += 5
-                if "order" in q or "purchase" in q:
-                    if any("entity:order" == t for t in ent.semantic_tags):
-                        score += 5
-                if "email" in q and any("email" in (f.semantic_tags or []) for f in ent.fields):
-                    score += 3
-                if "similar" in q or "embedding" in q:
-                    if any("embedding" in (f.semantic_tags or []) for f in ent.fields):
+                for tag in ent.semantic_tags:
+                    if tag.replace("entity:", "").replace("_", " ") in q:
                         score += 3
-                if "referral" in q or "referred" in q:
-                    if "referral" in (ent.semantic_tags or []):
-                        score += 3
+
+                matching_fields = []
+                for field in ent.fields:
+                    if field.name.lower() in q:
+                        score += 2
+                        matching_fields.append(field.name)
+                    elif any(tag.replace("_", " ") in q for tag in field.semantic_tags):
+                        score += 1
+                        matching_fields.append(field.name)
 
                 if score > 0:
                     matches.append(
@@ -88,6 +76,7 @@ class SchemaIndex:
                             "fields": [f.name for f in ent.fields],
                             "field_tags": {f.name: f.semantic_tags for f in ent.fields},
                             "default_id_field": ent.default_id_field,
+                            "matching_fields": matching_fields,
                             "score": score,
                         }
                     )
@@ -96,72 +85,91 @@ class SchemaIndex:
         return matches
 
     def build_sources_for_llm(self) -> List[Dict[str, Any]]:
-        """
-        Build a list of 'sources' for the LLM planning prompt.
-        Each source describes an MCP, its db_type, tools, entities, and fields.
-        """
         sources: List[Dict[str, Any]] = []
-
         for schema in self.schemas.values():
-            if schema.db_type == "sql":
-                tools = ["execute_sql", "get_schema"]
-            elif schema.db_type == "nosql":
-                tools = ["find", "get_schema"]
-            elif schema.db_type == "graph":
-                tools = ["traverse", "get_schema"]
-            elif schema.db_type == "vector":
-                tools = ["search", "get_schema"]
-            else:
-                tools = ["get_schema"]
-
-            entities: List[Dict[str, Any]] = []
-            for ent in schema.entities:
-                entities.append(
-                    {
-                        "name": ent.name,
-                        "semantic_tags": ent.semantic_tags,
-                        "default_id_field": ent.default_id_field,
-                        "fields": [
-                            {
-                                "name": f.name,
-                                "type": f.type,
-                                "semantic_tags": f.semantic_tags,
-                            }
-                            for f in ent.fields
-                        ],
-                    }
-                )
+            tools = [schema.metadata.get("primary_tool")] if schema.metadata.get("primary_tool") else []
+            if not tools:
+                if schema.db_type == "sql":
+                    tools = ["query.sql"]
+                elif schema.db_type == "nosql":
+                    tools = ["query.document"]
+                elif schema.db_type == "graph":
+                    tools = ["query.graph"]
+                elif schema.db_type == "vector":
+                    tools = ["query.vector"]
 
             sources.append(
                 {
                     "mcp_id": schema.mcp_id,
                     "db_type": schema.db_type,
                     "tools": tools,
-                    "entities": entities,
+                    "entities": [
+                        {
+                            "name": ent.name,
+                            "kind": ent.kind,
+                            "semantic_tags": ent.semantic_tags,
+                            "default_id_field": ent.default_id_field,
+                            "fields": [
+                                {
+                                    "name": field.name,
+                                    "type": field.type,
+                                    "description": field.description,
+                                    "semantic_tags": field.semantic_tags,
+                                }
+                                for field in ent.fields
+                            ],
+                        }
+                        for ent in schema.entities
+                    ],
                 }
             )
-
         return sources
+
+    def search_fields(self, q: str) -> List[Dict[str, Any]]:
+        needle = q.lower()
+        hits: List[Dict[str, Any]] = []
+        for schema in self.schemas.values():
+            for entity in schema.entities:
+                parent_hit = needle in entity.name.lower() or any(needle in tag.lower() for tag in entity.semantic_tags)
+                for field in entity.fields:
+                    score = 0.0
+                    if needle in field.name.lower():
+                        score += 1.0
+                    if any(needle in tag.lower() for tag in field.semantic_tags):
+                        score += 0.8
+                    if parent_hit:
+                        score += 0.2
+                    if score <= 0:
+                        continue
+                    hits.append(
+                        {
+                            "id": f"{schema.mcp_id}.{entity.name}.{field.name}",
+                            "mcp": schema.mcp_id,
+                            "parent": entity.name,
+                            "field": field.name,
+                            "field_type": field.type,
+                            "score": round(score, 2),
+                        }
+                    )
+        hits.sort(key=lambda item: item["score"], reverse=True)
+        return hits
 
 
 schema_index = SchemaIndex()
 
 
-# utility parser (for MCP /get_schema responses)
-
 def source_schema_from_dict(d: Dict[str, Any]) -> SourceSchema:
     entities: List[EntityInfo] = []
     for e in d.get("entities", []):
-        fields: List[FieldInfo] = []
-        for f in e.get("fields", []):
-            fields.append(
-                FieldInfo(
-                    name=f["name"],
-                    type=f.get("type", "text"),
-                    description=f.get("description"),
-                    semantic_tags=f.get("semantic_tags", []),
-                )
+        fields = [
+            FieldInfo(
+                name=f["name"],
+                type=f.get("type", "text"),
+                description=f.get("description"),
+                semantic_tags=f.get("semantic_tags", []),
             )
+            for f in e.get("fields", [])
+        ]
         entities.append(
             EntityInfo(
                 name=e["name"],
@@ -175,4 +183,5 @@ def source_schema_from_dict(d: Dict[str, Any]) -> SourceSchema:
         mcp_id=d["mcp_id"],
         db_type=d.get("db_type", "sql"),
         entities=entities,
+        metadata=d.get("metadata", {}),
     )
