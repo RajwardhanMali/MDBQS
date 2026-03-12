@@ -23,17 +23,55 @@ except Exception:
 PLAN_PROMPT_TEMPLATE = """
 You are a planning agent for a multi-source query system.
 
-Return ONLY JSON: an array of plan steps.
+You must ground every plan in the provided source schemas. Do not assume an e-commerce
+domain, "customers", "orders", or any table/collection/index unless those names appear
+in the provided schemas or the user explicitly mentions them.
+
+Return ONLY JSON: an array of plan steps. No markdown, no extra text.
 
 Each step must contain:
-- id
-- description
-- server_id
-- tool_name
-- arguments
-- depends_on
-- output_key
-- optional
+- id          : "p1", "p2", ... (string)
+- description : short human-readable label
+- server_id   : which MCP to call
+- tool_name   : e.g. "query.sql", "query.document", "query.graph", "query.vector"
+- arguments   : JSON object with the tool payload (see rules below)
+- depends_on  : id of a prior step this step requires, or null
+- output_key  : alias for this step's result set
+- optional    : true if the step may be skipped when its dependency has no results
+
+## Cross-step references
+When a later step needs values produced by an earlier step, use a dedicated
+"<field>_from" key in arguments, not a {{...}} template inside "params".
+
+Examples:
+  {{ "record_id_from": "p1.id" }}
+  {{ "record_ids_from": "p1.id" }}
+
+The execution engine will resolve *_from keys automatically:
+- A single-row reference like "p1.id" resolves to a scalar.
+- A multi-row reference like "p1.id" may resolve to a list when used for ids_from/list_from.
+
+## SQL steps (tool_name = "query.sql")
+- Use only "?" as positional placeholders.
+- Put literal param values in "params" as a flat object: {{"name": "Alice"}}.
+- For IN clauses driven by a prior step, use "ids_from" or another *_from key outside params. Example:
+    arguments: {{
+      "query": "SELECT id, title FROM records WHERE id IN (?)",
+      "record_ids_from": "p1.id"
+    }}
+
+## NoSQL steps (tool_name = "query.document")
+- Use "filter" for document filters.
+
+## Vector steps (tool_name = "query.vector")
+- Use "embedding_from": "p1.embedding" only when a prior step actually returns an embedding field.
+
+## General rules
+- Use the minimum number of steps needed.
+- Only call sources relevant to the query.
+- Use entity names and field names exactly as provided in the schemas.
+- If the query is broad or generic, prefer a small schema-valid exploratory step over inventing domain entities.
+- Never emit {{...}} template strings anywhere in the JSON output.
 
 Available sources:
 {sources_json}
@@ -92,152 +130,107 @@ class GroqClient:
             except Exception:
                 logger.exception("Groq planning failed, falling back to heuristic.")
 
-        return {"plan": self._heuristic_plan(nl_query, sources, recent_messages), "raw": None}
+        return {"plan": self._heuristic_plan(nl_query, sources), "raw": None}
 
-    def summarize_answer(self, user_message: str, result_sets: List[Dict[str, Any]], explain: List[str]) -> str:
-        if not result_sets:
-            return f"No matching data was found for: {user_message}"
-
-        error_sets = [result_set for result_set in result_sets if (result_set.get("meta") or {}).get("error")]
-        success_sets = [
-            result_set
-            for result_set in result_sets
-            if len(result_set.get("items", [])) > 0 and not (result_set.get("meta") or {}).get("error")
-        ]
-
-        if error_sets and not success_sets:
-            first_error = (error_sets[0].get("meta") or {}).get("error", "The query failed.")
-            return f"Some steps failed: {first_error}"
-
-        if error_sets and success_sets:
-            total = sum(len(rs.get("items", [])) for rs in success_sets)
-            first_error = (error_sets[0].get("meta") or {}).get("error", "A secondary step failed.")
-            return f"Found {total} records, but some steps failed: {first_error}"
-
-        first = result_sets[0]
-        count = len(first.get("items", []))
-        if count == 0:
-            return f"No matching data was found for: {user_message}"
-
-        if count == 1:
-            item = first["items"][0]
-            formatted = ", ".join(
-                f"{key}={value}"
-                for key, value in item.items()
-                if value is not None and not isinstance(value, (list, dict))
-            )
-            if formatted:
-                return formatted
-            return f"Found 1 result from {first['server_id']} for: {user_message}"
-        return f"Found {sum(len(rs.get('items', [])) for rs in result_sets)} records across {len(result_sets)} result sets."
-
-    def _heuristic_plan(
-        self,
-        nl_query: str,
-        sources: List[Dict[str, Any]],
-        recent_messages: List[ChatMessageRecord],
-    ) -> List[Dict[str, Any]]:
+    def _heuristic_plan(self, nl_query: str, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Deterministic schema-grounded fallback plan when the LLM is unavailable."""
         q = nl_query.lower()
-        node_id = 1
         plan: List[Dict[str, Any]] = []
+        node_id = 1
 
         def next_id() -> str:
             nonlocal node_id
-            value = f"p{node_id}"
+            nid = f"p{node_id}"
             node_id += 1
-            return value
+            return nid
 
-        def source_by_tool(tool_name: str) -> Optional[Dict[str, Any]]:
+        def score_entity(source: Dict[str, Any], entity: Dict[str, Any]) -> int:
+            score = 0
+            entity_name = (entity.get("name") or "").lower()
+            if entity_name and entity_name in q:
+                score += 6
+            for tag in entity.get("semantic_tags") or []:
+                normalized_tag = tag.replace("entity:", "").replace("_", " ").lower()
+                if normalized_tag and normalized_tag in q:
+                    score += 4
+            for field in entity.get("fields") or []:
+                field_name = (field.get("name") or "").lower()
+                if field_name and field_name in q:
+                    score += 2
+                for tag in field.get("semantic_tags") or []:
+                    normalized_tag = tag.replace("_", " ").lower()
+                    if normalized_tag and normalized_tag in q:
+                        score += 1
+            if source.get("db_type") == "sql":
+                score += 1
+            return score
+
+        ranked: List[tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+        for source in sources:
+            for entity in source.get("entities") or []:
+                ranked.append((score_entity(source, entity), source, entity))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+
+        best: Optional[tuple[Dict[str, Any], Dict[str, Any]]] = None
+        if ranked and ranked[0][0] > 0:
+            best = (ranked[0][1], ranked[0][2])
+        else:
             for source in sources:
-                if tool_name in source.get("tools", []):
-                    return source
-            return None
+                if source.get("db_type") == "sql" and source.get("entities"):
+                    best = (source, source["entities"][0])
+                    break
+            if best is None:
+                for source in sources:
+                    if source.get("entities"):
+                        best = (source, source["entities"][0])
+                        break
 
-        recent_text = " ".join(message.content.lower() for message in recent_messages[-4:])
-        merged_q = f"{recent_text} {q}".strip()
+        if best is None:
+            return plan
 
-        if "similar" in merged_q or "embedding" in merged_q:
-            vector_source = source_by_tool("query.vector")
-            sql_source = source_by_tool("query.sql")
-            if sql_source and vector_source:
-                step1 = next_id()
-                customer_id = _extract_identifier(merged_q) or "cust001"
-                plan.append(
-                    {
-                        "id": step1,
-                        "description": "Fetch reference entity for vector similarity",
-                        "server_id": sql_source["mcp_id"],
-                        "tool_name": "query.sql",
-                        "arguments": {
-                            "query": "SELECT id,name,email,embedding FROM customers WHERE id = ? LIMIT 1",
-                            "params": {"id": customer_id},
-                        },
-                        "depends_on": None,
-                        "output_key": "customer",
-                        "optional": False,
-                    }
-                )
-                plan.append(
-                    {
-                        "id": next_id(),
-                        "description": "Search similar entities",
-                        "server_id": vector_source["mcp_id"],
-                        "tool_name": "query.vector",
-                        "arguments": {"embedding_from": f"{step1}.embedding", "top_k": 3},
-                        "depends_on": step1,
-                        "output_key": "similar_customers",
-                        "optional": True,
-                    }
-                )
-                return plan
+        source, entity = best
+        output_key = entity["name"]
 
-        if any(word in merged_q for word in ["referral", "referrals", "referal", "referals", "referred"]):
-            graph_source = source_by_tool("query.graph")
-            if graph_source:
-                customer_id = _extract_identifier(merged_q) or "cust010"
-                plan.append(
-                    {
-                        "id": next_id(),
-                        "description": "Traverse graph referrals",
-                        "server_id": graph_source["mcp_id"],
-                        "tool_name": "query.graph",
-                        "arguments": {"start": {"property": "id", "value": customer_id}, "depth": 2},
-                        "depends_on": None,
-                        "output_key": "referrals",
-                        "optional": False,
-                    }
-                )
-                return plan
+        if source.get("db_type") == "sql":
+            fields = entity.get("fields") or []
+            default_id = entity.get("default_id_field")
+            if not default_id:
+                for field in fields:
+                    field_name = (field.get("name") or "").lower()
+                    if field_name == "id" or field_name.endswith("_id"):
+                        default_id = field["name"]
+                        break
 
-        mentions_orders = any(word in merged_q for word in ["order", "purchase"])
-        mentions_customer = any(word in merged_q for word in ["customer", "client", "email", "contact", "cust"])
-        mentions_all = "all customers" in merged_q or "list customers" in merged_q or "list of all customers" in merged_q
+            projection: List[str] = []
+            for candidate in ("id", "name", "title", "email", "description"):
+                for field in fields:
+                    if field.get("name") == candidate and candidate not in projection:
+                        projection.append(candidate)
+            for field in fields:
+                name = field.get("name")
+                if name and name not in projection:
+                    projection.append(name)
+                if len(projection) >= 5:
+                    break
+            if not projection:
+                projection = ["*"]
 
-        sql_source = source_by_tool("query.sql")
-        doc_source = source_by_tool("query.document")
-
-        if mentions_customer and sql_source:
-            customer_id = _extract_identifier(merged_q)
-            person_name = _extract_quoted_name(nl_query)
-            query = "SELECT id,name,email,embedding FROM customers LIMIT 1"
+            identifier = _extract_identifier(q)
+            query = f"SELECT {', '.join(projection)} FROM {entity['name']}"
             params: Dict[str, Any] = {}
-            output_key = "customer"
-            if mentions_all:
-                query = "SELECT id,name,email FROM customers ORDER BY id"
-                output_key = "customers"
-            elif customer_id:
-                query = "SELECT id,name,email,embedding FROM customers WHERE id = ? LIMIT 1"
-                params = {"id": customer_id}
-            elif person_name:
-                query = "SELECT id,name,email,embedding FROM customers WHERE name ILIKE ? LIMIT 1"
-                params = {"name": person_name}
+            if identifier and default_id:
+                query += f" WHERE {default_id} = ?"
+                params = {default_id: identifier}
+                if output_key.endswith("s"):
+                    output_key = output_key[:-1]
+            query += " LIMIT 10"
 
-            sql_step = next_id()
             plan.append(
                 {
-                    "id": sql_step,
-                    "description": "Fetch matching structured records",
-                    "server_id": sql_source["mcp_id"],
+                    "id": next_id(),
+                    "description": f"Fetch rows from {entity['name']}",
+                    "server_id": source["mcp_id"],
                     "tool_name": "query.sql",
                     "arguments": {"query": query, "params": params},
                     "depends_on": None,
@@ -245,60 +238,97 @@ class GroqClient:
                     "optional": False,
                 }
             )
-            if mentions_orders and doc_source and not mentions_all:
+            return plan
+
+        if source.get("db_type") == "nosql":
+            plan.append(
+                {
+                    "id": next_id(),
+                    "description": f"Fetch documents from {entity['name']}",
+                    "server_id": source["mcp_id"],
+                    "tool_name": "query.document",
+                    "arguments": {"collection": entity["name"], "filter": {}, "limit": 10},
+                    "depends_on": None,
+                    "output_key": output_key,
+                    "optional": False,
+                }
+            )
+            return plan
+
+        if source.get("db_type") == "graph":
+            identifier = _extract_identifier(q)
+            if identifier:
                 plan.append(
                     {
                         "id": next_id(),
-                        "description": "Fetch related documents",
-                        "server_id": doc_source["mcp_id"],
-                        "tool_name": "query.document",
-                        "arguments": {"collection": "orders", "customer_id_from": f"{sql_step}.id", "limit": 5},
-                        "depends_on": sql_step,
-                        "output_key": "recent_orders",
-                        "optional": True,
+                        "description": f"Traverse graph from {identifier}",
+                        "server_id": source["mcp_id"],
+                        "tool_name": "query.graph",
+                        "arguments": {"start": {"property": "id", "value": identifier}, "depth": 2},
+                        "depends_on": None,
+                        "output_key": output_key,
+                        "optional": False,
                     }
                 )
             return plan
 
-        if mentions_orders and doc_source:
-            plan.append(
-                {
-                    "id": next_id(),
-                    "description": "Fetch documents",
-                    "server_id": doc_source["mcp_id"],
-                    "tool_name": "query.document",
-                    "arguments": {"collection": "orders", "filter": {}, "limit": 10},
-                    "depends_on": None,
-                    "output_key": "recent_orders",
-                    "optional": False,
-                }
-            )
-            return plan
-
-        if sql_source:
-            plan.append(
-                {
-                    "id": next_id(),
-                    "description": "Fallback structured lookup",
-                    "server_id": sql_source["mcp_id"],
-                    "tool_name": "query.sql",
-                    "arguments": {"query": "SELECT id,name,email FROM customers LIMIT 5", "params": {}},
-                    "depends_on": None,
-                    "output_key": "results",
-                    "optional": False,
-                }
-            )
         return plan
+
+    def summarize_answer(
+        self,
+        nl_query: str,
+        result_sets: List[Dict[str, Any]],
+        tool_calls: List[Dict[str, Any]],
+    ) -> str:
+        """Produce a human-readable summary of execution results."""
+        failed = [rs for rs in result_sets if rs.get("meta", {}).get("error")]
+        total_rows = sum(len(rs.get("items", [])) for rs in result_sets)
+
+        if failed and total_rows == 0:
+            errors = "; ".join(rs["meta"]["error"] for rs in failed)
+            return f"Query failed: {errors}"
+
+        parts = [f"Found {total_rows} records"]
+        if failed:
+            parts.append("but some steps failed")
+            for rs in failed:
+                parts.append(rs["meta"]["error"])
+
+        data_lines = []
+        for rs in result_sets:
+            items = rs.get("items") or rs.get("result", [])
+            if not items:
+                continue
+            key = rs.get("key") or rs.get("plan_node_id", "result")
+            server = rs.get("server_id", "")
+            row_count = len(items)
+            display = items[:3]
+            data_lines.append(f"- {key} from {server} ({row_count} rows)")
+            for item in display:
+                data_lines.append("  " + ", ".join(f"{k}={v}" for k, v in item.items()))
+            if row_count > 3:
+                data_lines.append(f"  ... {row_count - 3} more rows")
+
+        summary = ": ".join(parts)
+        if data_lines:
+            summary += "\nData:\n" + "\n".join(data_lines)
+
+        explain_lines = []
+        for rs in result_sets:
+            key = rs.get("key") or rs.get("plan_node_id", "result")
+            server = rs.get("server_id", "")
+            tool = rs.get("tool_name") or (rs.get("meta") or {}).get("source_type", "")
+            explain_lines.append(f"- {key} from {server} via {tool}")
+            err = (rs.get("meta") or {}).get("error")
+            if err:
+                explain_lines.append(f"- {key} failed on {server}: {err}")
+
+        if explain_lines:
+            summary += "\nExplain:\n" + "\n".join(explain_lines)
+
+        return summary
 
 
 def _extract_identifier(text: str) -> Optional[str]:
-    match = re.search(r"\bcust\d+\b", text)
+    match = re.search(r"\b[a-z]{2,10}\d+\b", text)
     return match.group(0) if match else None
-
-
-def _extract_quoted_name(text: str) -> Optional[str]:
-    if "'" in text:
-        parts = text.split("'")
-        if len(parts) >= 3:
-            return parts[1]
-    return None

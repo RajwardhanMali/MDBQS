@@ -50,3 +50,15 @@ def test_graph_referral_workflow_returns_rows_and_formatted_answer():
     assert len(referral_sets[0]["items"]) > 0, body
     assert "No matching data was found" not in body["answer"]
     assert any("referrals" in line for line in body["explain"])
+
+
+def test_high_order_customers_workflow_joins_customer_details_without_sql_array_error():
+    session_id = create_session()
+    body = chat(session_id, "show me all the customers with more than 5 orders")
+
+    detail_sets = [rs for rs in body["result_sets"] if rs["server_id"] == "sql_customers"]
+    assert detail_sets, body
+    assert len(detail_sets[0]["items"]) > 0, body
+    assert not detail_sets[0]["meta"].get("error"), body
+    assert "unnest(unknown)" not in body["answer"]
+    assert "expects 1 argument" not in body["answer"]

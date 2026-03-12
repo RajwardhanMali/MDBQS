@@ -1,105 +1,60 @@
 #!/bin/bash
 
-# MDBQS - Run All Servers Script
-# Starts Docker containers (PostgreSQL, MongoDB, Neo4j, Milvus) and FastAPI backend
+# --- Configuration ---
+PORTS=(8000 8001 8002 8003 8004)
+VENV_PATH=".venv/bin/activate"
 
-echo "================================"
-echo "MDBQS - Starting All Servers"
-echo "================================"
-echo ""
+# --- Logic: Stop Services ---
+if [ "$1" == "stop" ]; then
+    echo "Stopping MCP services on ports: ${PORTS[*]}..."
 
-# Check if Docker is running
-echo "[1/3] Checking Docker..."
-if ! docker ps > /dev/null 2>&1; then
-    echo "ERROR: Docker daemon is not running. Please start Docker."
-    exit 1
+    for port in "${PORTS[@]}"; do
+        PID=$(lsof -ti:$port)
+
+        if [ -n "$PID" ]; then
+            kill -9 $PID
+            echo "Terminated process on port $port"
+        fi
+    done
+
+    echo "All specified services stopped."
+    exit 0
 fi
-echo "✓ Docker is running"
 
-echo ""
 
-# Start Docker containers
-echo "[2/3] Starting Docker containers (PostgreSQL, MongoDB, Neo4j, Milvus)..."
-docker-compose up -d
-if [ $? -ne 0 ]; then
-    echo "ERROR: Failed to start Docker containers."
-    exit 1
-fi
-echo "✓ Docker containers started"
+# --- Function: Launch Service ---
+launch_service () {
+    TITLE=$1
+    PORT=$2
+    APP_PATH=$3
+    RELOAD=$4
 
-echo ""
-
-# Wait for databases to be ready
-echo "[3/3] Waiting for databases to be healthy (30 seconds)..."
-sleep 5
-
-# Check PostgreSQL
-echo "  • Checking PostgreSQL..."
-maxAttempts=10
-attempt=0
-while [ $attempt -lt $maxAttempts ]; do
-    if docker-compose exec -T postgres pg_isready -U postgres 2>&1 | grep -q "accepting connections"; then
-        echo "    ✓ PostgreSQL is ready"
-        break
+    RELOAD_FLAG=""
+    if [ "$RELOAD" = true ]; then
+        RELOAD_FLAG="--reload"
     fi
-    ((attempt++))
-    sleep 2
-done
 
-if [ $attempt -eq $maxAttempts ]; then
-    echo "    ⚠ PostgreSQL may not be ready yet"
-fi
+    CMD="source $VENV_PATH && uvicorn $APP_PATH --port $PORT $RELOAD_FLAG"
 
-# Check MongoDB
-echo "  • Checking MongoDB..."
-attempt=0
-while [ $attempt -lt $maxAttempts ]; do
-    if docker-compose exec -T mongo mongo --eval "db.adminCommand('ping')" 2>&1 | grep -q "ok"; then
-        echo "    ✓ MongoDB is ready"
-        break
+    # Try opening in new terminal tab (Linux GNOME)
+    if command -v gnome-terminal &> /dev/null
+    then
+        gnome-terminal --tab --title="$TITLE" -- bash -c "$CMD; exec bash"
+    else
+        # fallback: run in background
+        echo "Launching $TITLE on port $PORT"
+        bash -c "$CMD" &
     fi
-    ((attempt++))
-    sleep 2
-done
+}
 
-if [ $attempt -eq $maxAttempts ]; then
-    echo "    ⚠ MongoDB may not be ready yet"
-fi
 
-# Check Neo4j
-echo "  • Checking Neo4j..."
-if docker-compose logs neo4j 2>&1 | grep -q "started"; then
-    echo "    ✓ Neo4j is ready"
-else
-    echo "    ⚠ Neo4j may not be ready yet"
-fi
+# --- Execution ---
+echo "Launching MCP services with .venv..."
 
-echo ""
-echo "================================"
-echo "Backend Startup"
-echo "================================"
-echo ""
+launch_service "SQL_MCP"    8001 "app.mcp_plugins.mcp_sql_sample.main:app" true
+launch_service "NoSQL_MCP"  8002 "app.mcp_plugins.mcp_nosql_sample.main:app" true
+launch_service "Graph_MCP"  8003 "app.mcp_plugins.mcp_graph_sample.main:app" true
+launch_service "Vector_MCP" 8004 "app.mcp_plugins.mcp_vector_sample.main:app" true
+launch_service "Backend"    8000 "app.main:app" true
 
-# Check if virtual environment exists
-if [ ! -d "venv" ]; then
-    echo "ERROR: Virtual environment not found. Please run:"
-    echo "  python3 -m venv venv"
-    echo "  source venv/bin/activate"
-    echo "  pip install -r requirements.txt"
-    exit 1
-fi
-
-# Activate virtual environment
-echo "Activating virtual environment..."
-source venv/bin/activate
-
-echo ""
-echo "Starting FastAPI backend on http://localhost:8000"
-echo "Swagger UI: http://localhost:8000/docs"
-echo "ReDoc: http://localhost:8000/redoc"
-echo ""
-echo "Press Ctrl+C to stop the server"
-echo ""
-
-# Start FastAPI
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+echo "Done. Services started."

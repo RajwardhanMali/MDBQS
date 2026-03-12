@@ -68,6 +68,8 @@ def compatibility_fused_data(result_sets: List[ExecutionResultSet], nl_query: Op
 
     for result_set in result_sets:
         key = result_set.key
+        if key not in fused:
+            fused[key] = list(result_set.items)
         if key == "customer" and result_set.items:
             fused["customer"] = result_set.items[0]
         elif key == "customers":

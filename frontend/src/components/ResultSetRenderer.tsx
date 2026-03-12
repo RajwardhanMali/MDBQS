@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react';
 import { AlertTriangle, Braces, ChevronDown, ChevronUp, TableProperties } from 'lucide-react';
-import { ResultSet } from '../types/apiTypes';
+import { ResultSet, SimilarCustomer } from '../types/apiTypes';
 import { humanizeKey } from '../utils/formatters';
 import ResultSetTable from './ResultSetTable';
 import ResultSetCards from './ResultSetCards';
+import SimilarCustomerCard from './SimilarCustomerCard';
 
 interface ResultSetRendererProps {
   resultSet: ResultSet;
@@ -27,11 +28,9 @@ const mapErrorMessage = (errorCode: string) => {
   if (errorCode === 'INVALID_VECTOR_INPUT') {
     return 'Vector search could not run because the embedding input was invalid or missing.';
   }
-
   if (errorCode === 'MISSING_DEPENDENCY') {
     return 'This step could not run because a previous step did not return the required data.';
   }
-
   return 'This result set failed to execute.';
 };
 
@@ -47,13 +46,13 @@ const flattenItem = (item: Record<string, unknown>) => {
 
     if (isPlainObject(value)) {
       const nestedEntries = Object.entries(value);
-      const nestedIsScalar = nestedEntries.every(([, nestedValue]) => isScalar(nestedValue));
+      const allScalar = nestedEntries.every(([, nestedValue]) => isScalar(nestedValue));
 
-      if (nestedIsScalar) {
+      if (allScalar) {
         nestedEntries.forEach(([nestedKey, nestedValue]) => {
           flat[`${key}.${nestedKey}`] = nestedValue;
         });
-        return;
+        return; // Bug 3 fix: missing return caused fall-through to supported=false
       }
     }
 
@@ -141,6 +140,48 @@ const EmptyResultSet = ({ resultSet, rowCount }: { resultSet: ResultSet; rowCoun
   </section>
 );
 
+// ── Vector / similarity result set ────────────────────────────────────────────
+// Detected by tool_name or key — renders using SimilarCustomerCard instead of
+// the generic table so that rank, score, distance, name and email are shown.
+const isVectorResultSet = (resultSet: ResultSet): boolean =>
+  resultSet.tool_name === 'query.vector' || resultSet.key === 'similar_customers';
+
+const VectorResultSet = ({ resultSet }: { resultSet: ResultSet }) => {
+  const [expanded, setExpanded] = useState(false);
+  const items = Array.isArray(resultSet.items) ? resultSet.items : [];
+  const meta = resultSet.meta ?? {};
+  const rowCount = typeof meta.row_count === 'number' ? meta.row_count : items.length;
+  const visibleItems = expanded ? items : items.slice(0, 6);
+
+  return (
+    <section className="overflow-hidden rounded-[1.75rem] border border-border/70 bg-card/80 shadow-sm">
+      <ResultSetHeader resultSet={resultSet} rowCount={rowCount} />
+      <div className="p-4">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {visibleItems.map((item, idx) => (
+            <SimilarCustomerCard
+              key={`sim-${idx}`}
+              customer={item as SimilarCustomer}
+              rank={idx + 1}
+            />
+          ))}
+        </div>
+        {items.length > 6 && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="mt-3 inline-flex items-center gap-2 rounded-full border border-border/70 bg-background px-3 py-1.5 text-xs text-foreground"
+          >
+            {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+            {expanded ? 'Show less' : `Show all ${items.length}`}
+          </button>
+        )}
+      </div>
+    </section>
+  );
+};
+
+// ── Main renderer ─────────────────────────────────────────────────────────────
 const ResultSetRenderer = ({ resultSet }: ResultSetRendererProps) => {
   const [showRaw, setShowRaw] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -157,15 +198,9 @@ const ResultSetRenderer = ({ resultSet }: ResultSetRendererProps) => {
   const flattened = useMemo(() => visibleItems.map((item) => flattenItem(item)), [visibleItems]);
 
   const renderMode = useMemo<'table' | 'cards'>(() => {
-    if (!items.length) {
-      return 'cards';
-    }
-
+    if (!items.length) return 'cards';
     const directlyFlat = items.every((item) => Object.values(item).every(isScalar));
-    if (directlyFlat) {
-      return 'table';
-    }
-
+    if (directlyFlat) return 'table';
     const flattenable = items.every((item) => flattenItem(item).supported);
     return flattenable ? 'table' : 'cards';
   }, [items]);
@@ -173,11 +208,7 @@ const ResultSetRenderer = ({ resultSet }: ResultSetRendererProps) => {
   const keys = useMemo(() => {
     const ordered = new Set<string>();
     const source = renderMode === 'table' ? flattened.map((entry) => entry.flat) : visibleItems;
-
-    source.forEach((item) => {
-      Object.keys(item).forEach((key) => ordered.add(key));
-    });
-
+    source.forEach((item) => Object.keys(item).forEach((key) => ordered.add(key)));
     return Array.from(ordered);
   }, [flattened, renderMode, visibleItems]);
 
@@ -197,6 +228,11 @@ const ResultSetRenderer = ({ resultSet }: ResultSetRendererProps) => {
 
   if (!hasItems) {
     return <EmptyResultSet resultSet={resultSet} rowCount={rowCount} />;
+  }
+
+  // Vector results get the dedicated card grid
+  if (isVectorResultSet(resultSet)) {
+    return <VectorResultSet resultSet={resultSet} />;
   }
 
   return (
@@ -220,36 +256,25 @@ const ResultSetRenderer = ({ resultSet }: ResultSetRendererProps) => {
               className="inline-flex items-center gap-2 rounded-full border border-border/70 bg-background px-3 py-1.5 text-xs text-foreground"
             >
               {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-              {expanded ? 'Show fewer' : `Show all ${items.length}`}
+              {expanded ? 'Show less' : `Show all ${items.length}`}
             </button>
           )}
-        </div>
-
-        <div className="space-y-4">
-          <div className="inline-flex items-center gap-2 rounded-full bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
-            <TableProperties className="h-3.5 w-3.5" />
-            {renderMode === 'table' ? 'Table view' : 'Card view'}
-          </div>
-          {renderMode === 'table' ? (
-            <ResultSetTable items={tableItems} keys={keys} />
-          ) : (
-            <ResultSetCards items={visibleItems} />
+          {renderMode === 'table' && (
+            <span className="inline-flex items-center gap-2 rounded-full border border-border/70 bg-background px-3 py-1.5 text-xs text-muted-foreground">
+              <TableProperties className="h-3.5 w-3.5" />
+              {keys.length} columns
+            </span>
           )}
         </div>
 
-        {Object.keys(meta).length > 0 && (
-          <details className="rounded-2xl border border-border/70 bg-background/50 px-4 py-3">
-            <summary className="cursor-pointer text-sm font-medium text-foreground">Result metadata</summary>
-            <pre className="mt-3 overflow-x-auto rounded-xl bg-muted/60 p-3 text-xs text-muted-foreground">
-              {JSON.stringify(meta, null, 2)}
-            </pre>
-          </details>
-        )}
-
-        {showRaw && (
-          <pre className="overflow-x-auto rounded-2xl bg-ink p-4 text-xs text-ink-foreground">
-            {JSON.stringify(resultSet, null, 2)}
+        {showRaw ? (
+          <pre className="overflow-auto rounded-xl bg-background/70 p-4 text-xs text-foreground">
+            {JSON.stringify(visibleItems, null, 2)}
           </pre>
+        ) : renderMode === 'table' ? (
+          <ResultSetTable keys={keys} items={tableItems} />
+        ) : (
+          <ResultSetCards keys={keys} items={visibleItems} />
         )}
       </div>
     </section>

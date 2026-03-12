@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -9,8 +10,11 @@ from app.services import mcp_manager
 logger = logging.getLogger("execution")
 logger.setLevel(logging.INFO)
 
+_TMPL_RE = re.compile(r"\{\{(.+?)\}\}")
+
 
 def _resolve_ref(results_by_id: Dict[str, ExecutionResultSet], ref: str) -> Any:
+    """Return a single value from the first row of a prior result set."""
     if not ref:
         return None
 
@@ -25,6 +29,83 @@ def _resolve_ref(results_by_id: Dict[str, ExecutionResultSet], ref: str) -> Any:
             value = value.get(key)
         else:
             return None
+    return value
+
+
+def _should_resolve_as_list(
+    argument_name: str,
+    ref: str,
+    results_by_id: Dict[str, ExecutionResultSet],
+) -> bool:
+    if "[*]" in ref:
+        return True
+
+    lowered_name = argument_name.lower()
+    if lowered_name.endswith("ids_from") or lowered_name.endswith("list_from"):
+        return True
+
+    parts = ref.replace("[*]", "").split(".")
+    result_set = results_by_id.get(parts[0])
+    return bool(result_set and len(result_set.items) > 1 and len(parts) > 1)
+
+
+def _resolve_ref_list(results_by_id: Dict[str, ExecutionResultSet], ref: str) -> Any:
+    """
+    Return a list of values extracted from ALL rows of a prior result set.
+    e.g. ref = "p1.customer_id"  →  [row["customer_id"] for row in p1.items]
+    If ref has no field part, returns the full list of row dicts.
+    """
+    if not ref:
+        return None
+
+    # Strip [*] wildcard notation if present
+    ref = ref.replace("[*]", "")
+
+    parts = ref.split(".")
+    result_set = results_by_id.get(parts[0])
+    if not result_set or not result_set.items:
+        return None
+
+    if len(parts) == 1:
+        if all(isinstance(row, dict) and len(row) == 1 for row in result_set.items):
+            first_key = next(iter(result_set.items[0].keys()))
+            return [row.get(first_key) for row in result_set.items]
+        return result_set.items
+
+    field = parts[1]
+    return [
+        row.get(field)
+        for row in result_set.items
+        if isinstance(row, dict) and field in row
+    ]
+
+
+def _expand_templates(value: Any, results_by_id: Dict[str, ExecutionResultSet]) -> Any:
+    """
+    Recursively walk an argument structure and resolve any {{step.field}} or
+    {{step.field[*].col}} template expressions into real values.
+
+    - A single-row reference (e.g. {{p1.id}}) resolves via _resolve_ref → scalar.
+    - A multi-row / wildcard reference (e.g. {{p1.customer_id[*]}}) resolves via
+      _resolve_ref_list → list, suitable for SQL IN clauses.
+    """
+    if isinstance(value, str):
+        m = _TMPL_RE.fullmatch(value.strip())
+        if m:
+            ref = m.group(1).strip()
+            if "[*]" in ref:
+                return _resolve_ref_list(results_by_id, ref)
+            # Heuristic: if the referenced step has multiple rows, return list
+            parts = ref.replace("[*]", "").split(".")
+            result_set = results_by_id.get(parts[0])
+            if result_set and len(result_set.items) > 1:
+                return _resolve_ref_list(results_by_id, ref)
+            return _resolve_ref(results_by_id, ref)
+        return value
+    if isinstance(value, dict):
+        return {k: _expand_templates(v, results_by_id) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_templates(v, results_by_id) for v in value]
     return value
 
 
@@ -97,11 +178,34 @@ async def execute_plan_steps(plan_steps: List[PlanStep]) -> tuple[List[Execution
             )
             continue
 
+        # Resolve *_from references (e.g. embedding_from, customer_id_from)
         for key, value in list(arguments.items()):
             if key.endswith("_from"):
-                resolved = _resolve_ref(results_by_id, _normalize_ref(value, output_keys_by_step_id))
-                arguments[key[:-5]] = resolved
+                normalized_ref = _normalize_ref(value, output_keys_by_step_id)
+                if _should_resolve_as_list(key, normalized_ref, results_by_id):
+                    resolved = _resolve_ref_list(results_by_id, normalized_ref)
+                else:
+                    resolved = _resolve_ref(results_by_id, normalized_ref)
+                target_key = key[:-5]
+                arguments[target_key] = resolved
                 arguments.pop(key)
+
+        if step.tool_name == "query.sql":
+            params = arguments.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            else:
+                params = dict(params)
+
+            for key in list(arguments.keys()):
+                if key not in {"query", "params"}:
+                    params[key] = arguments.pop(key)
+
+            arguments["params"] = params
+
+        # Resolve {{...}} template expressions anywhere in the arguments,
+        # including inside nested "params" dicts produced by the LLM.
+        arguments = _expand_templates(arguments, results_by_id)
 
         validation_error = _validate_tool_arguments(step, arguments)
         if validation_error:
@@ -114,6 +218,7 @@ async def execute_plan_steps(plan_steps: List[PlanStep]) -> tuple[List[Execution
             )
             result_sets.append(result_set)
             results_by_id[step.id] = result_set
+            results_by_id[step.output_key] = result_set
             tool_calls.append(
                 {
                     "step_id": step.id,
@@ -145,7 +250,11 @@ async def execute_plan_steps(plan_steps: List[PlanStep]) -> tuple[List[Execution
                 meta["error"],
                 source_id=meta.get("source_id", step.server_id),
                 source_type=meta.get("source_type", step.tool_name),
-                error_code="INVALID_VECTOR_INPUT" if step.tool_name == "query.vector" and "dimension 3" in meta["error"] else "EXECUTION_ERROR",
+                error_code=(
+                    "INVALID_VECTOR_INPUT"
+                    if step.tool_name == "query.vector" and "dimension 3" in meta["error"]
+                    else "EXECUTION_ERROR"
+                ),
                 recoverable=True,
             ) | {k: v for k, v in meta.items() if k not in {"error", "error_code", "recoverable", "source_id", "source_type"}}
 
@@ -158,6 +267,7 @@ async def execute_plan_steps(plan_steps: List[PlanStep]) -> tuple[List[Execution
         )
         result_sets.append(result_set)
         results_by_id[step.id] = result_set
+        results_by_id[step.output_key] = result_set
         tool_calls.append(
             {
                 "step_id": step.id,
